@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Frisco UTM — Drone Traffic Monitor</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  :root{
+    --bg:#0b0f14; --panel:#0f151d; --panel-2:#141c26;
+    --line:#1f2a36; --text:#e6edf3; --muted:#8b949e;
+    --live:#3fb950;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:var(--bg); color:var(--text);
+    font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+    overflow:hidden;
+  }
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+
+  #map{position:absolute; inset:0 0 0 320px; background:var(--bg)}
+
+  /* ---- control-board side panel ---- */
+  #panel{
+    position:absolute; top:0; left:0; bottom:0; width:320px;
+    background:var(--panel); border-right:1px solid var(--line);
+    display:flex; flex-direction:column; z-index:1000;
+  }
+  .head{padding:16px 18px 14px; border-bottom:1px solid var(--line)}
+  .title{font-size:18px; font-weight:700; letter-spacing:.5px}
+  .sub{font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:2px; margin-top:2px}
+  .live{display:flex; align-items:center; gap:7px; margin-top:10px; font-size:12px; color:var(--muted)}
+  .dot{width:8px; height:8px; border-radius:50%; background:var(--live); box-shadow:0 0 8px var(--live)}
+  .dot.pulse{animation:pulse 1.6s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+  .totals{display:flex; gap:10px; padding:14px 18px; border-bottom:1px solid var(--line)}
+  .stat{flex:1; background:var(--panel-2); border:1px solid var(--line); border-radius:8px; padding:10px 12px}
+  .stat .n{font-size:22px; font-weight:700}
+  .stat .l{font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:1px}
+
+  .fleets{flex:1; overflow-y:auto; padding:6px 0}
+  .co{padding:12px 18px 6px; display:flex; align-items:center; gap:8px}
+  .co .swatch{width:10px; height:10px; border-radius:2px}
+  .co .name{font-weight:600; font-size:13px}
+  .co .ct{margin-left:auto; font-size:11px; color:var(--muted)}
+  .row{
+    display:grid; grid-template-columns:14px 34px 1fr auto; gap:8px; align-items:center;
+    padding:5px 18px; font-size:12px;
+  }
+  .row .sd{width:8px; height:8px; border-radius:50%}
+  .row .id{color:var(--muted)}
+  .row .rd{color:var(--muted); font-size:11px; text-align:right}
+  .row.stale{opacity:.45}
+
+  .legend{border-top:1px solid var(--line); padding:12px 18px; font-size:11px; color:var(--muted)}
+  .legend div{display:flex; align-items:center; gap:8px; margin:4px 0}
+  .legend .k{width:14px; text-align:center}
+
+  /* ---- drone markers ---- */
+  .drone-icon{background:none; border:none}
+  .drone{position:relative; width:30px; height:30px}
+  .drone .arrow{
+    position:absolute; left:50%; top:50%; width:0; height:0;
+    border-left:7px solid transparent; border-right:7px solid transparent;
+    border-bottom:15px solid var(--c);
+    transform-origin:50% 70%; translate:-50% -65%;
+    filter:drop-shadow(0 0 4px var(--c));
+  }
+  .drone.stale .arrow{filter:none; opacity:.5}
+  .drone.ring::before{
+    content:""; position:absolute; left:50%; top:50%;
+    width:26px; height:26px; margin:-13px 0 0 -13px;
+    border:1.5px solid var(--c); border-radius:50%; opacity:.7;
+  }
+  .drone .tag{
+    position:absolute; left:19px; top:16px;
+    font:600 10px ui-monospace,monospace; color:var(--text);
+    text-shadow:0 0 3px #000,0 0 3px #000; white-space:nowrap;
+  }
+  .depot{
+    width:14px; height:14px; transform:rotate(45deg);
+    border:2px solid var(--c); background:rgba(0,0,0,.4);
+  }
+  .depot-wrap{position:relative}
+  .depot-wrap .dlabel{
+    position:absolute; left:18px; top:0; font:600 11px system-ui;
+    color:var(--c); text-shadow:0 0 4px #000; white-space:nowrap;
+  }
+  @media (prefers-reduced-motion: reduce){ .dot.pulse{animation:none} }
+</style>
+</head>
+<body>
+  <div id="panel">
+    <div class="head">
+      <div class="title">FRISCO UTM</div>
+      <div class="sub">UAS Traffic Management</div>
+      <div class="live"><span class="dot pulse"></span><span id="status">connecting…</span></div>
+    </div>
+    <div class="totals">
+      <div class="stat"><div class="n" id="t-active">0</div><div class="l">Active</div></div>
+      <div class="stat"><div class="n" id="t-total">0</div><div class="l">Tracked</div></div>
+    </div>
+    <div class="fleets" id="fleets"></div>
+    <div class="legend">
+      <div><span class="k">▲</span> drone (arrow = heading)</div>
+      <div><span class="k">◯</span> ringed = real autopilot (SITL)</div>
+      <div><span class="k">◆</span> company depot</div>
+    </div>
+  </div>
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const map = L.map('map', {zoomControl:true, attributionControl:true})
+      .setView([33.150, -96.823], 12);
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+      attribution:'&copy; OpenStreetMap &copy; CARTO', subdomains:'abcd', maxZoom:19
+    }).addTo(map);
+
+    const droneMarkers = {}, trails = {};
+    let depotsDrawn = false;
+    const TRAIL_MAX = 80;
+
+    function droneIcon(d){
+      const hdg = (d.hdg==null) ? 0 : d.hdg;
+      const ring = d.kind === 'SITL' ? 'ring' : '';
+      const html =
+        `<div class="drone ${d.status} ${ring}" style="--c:${d.color}">
+           <div class="arrow" style="transform:rotate(${hdg}deg)"></div>
+           <div class="tag">${d.sysid}</div>
+         </div>`;
+      return L.divIcon({html, className:'drone-icon', iconSize:[30,30], iconAnchor:[15,15]});
+    }
+
+    function tip(d){
+      const h = d.hdg==null ? '—' : d.hdg.toFixed(0)+'°';
+      return `<b style="color:${d.color}">${d.company} · #${d.sysid}</b><br>`
+           + `<span class="mono">alt ${d.alt_m} m &nbsp; ${d.speed_ms} m/s &nbsp; ${h}</span>`
+           + (d.status==='stale' ? '<br><i>signal lost</i>' : '');
+    }
+
+    function drawDepots(depots){
+      depots.forEach(p=>{
+        const icon = L.divIcon({className:'', iconSize:[14,14], iconAnchor:[7,7],
+          html:`<div class="depot-wrap"><div class="depot" style="--c:${p.color}"></div>`
+              + `<div class="dlabel" style="--c:${p.color}">${p.company} depot</div></div>`});
+        L.marker([p.lat,p.lon],{icon, interactive:false}).addTo(map);
+      });
+    }
+
+    function updateDrones(data){
+      if(!depotsDrawn && data.depots){ drawDepots(data.depots); depotsDrawn = true; }
+      const seen = new Set();
+      data.drones.forEach(d=>{
+        seen.add(d.sysid);
+        const ll = [d.lat, d.lon];
+
+        if(!trails[d.sysid]){
+          trails[d.sysid] = L.polyline([], {color:d.color, weight:2, opacity:.45});
+          trails[d.sysid].addTo(map); trails[d.sysid]._pts = [];
+        }
+        const tr = trails[d.sysid];
+        tr._pts.push(ll); if(tr._pts.length>TRAIL_MAX) tr._pts.shift();
+        tr.setLatLngs(tr._pts);
+
+        if(!droneMarkers[d.sysid]){
+          droneMarkers[d.sysid] = L.marker(ll,{icon:droneIcon(d)}).addTo(map)
+            .bindTooltip(tip(d),{direction:'top',offset:[0,-14]});
+        }
+        const m = droneMarkers[d.sysid];
+        m.setLatLng(ll); m.setIcon(droneIcon(d)); m.setTooltipContent(tip(d));
+      });
+      // drop markers/trails for drones that vanished entirely
+      Object.keys(droneMarkers).forEach(sid=>{
+        if(!seen.has(+sid)){
+          map.removeLayer(droneMarkers[sid]); delete droneMarkers[sid];
+          if(trails[sid]){ map.removeLayer(trails[sid]); delete trails[sid]; }
+        }
+      });
+    }
+
+    function updatePanel(data){
+      document.getElementById('t-active').textContent = data.counts.active;
+      document.getElementById('t-total').textContent  = data.counts.total;
+      const when = new Date(data.updated*1000).toLocaleTimeString();
+      document.getElementById('status').textContent = 'live · updated '+when;
+
+      const byCo = {};
+      data.drones.forEach(d=>{ (byCo[d.company]=byCo[d.company]||[]).push(d); });
+
+      let html = '';
+      Object.keys(data.colors).forEach(co=>{
+        const list = (byCo[co]||[]).sort((a,b)=>a.sysid-b.sysid);
+        const color = data.colors[co];
+        html += `<div class="co"><span class="swatch" style="background:${color}"></span>`
+              + `<span class="name">${co}</span><span class="ct">${list.length} aircraft</span></div>`;
+        list.forEach(d=>{
+          const live = d.status==='active';
+          const sd = live ? color : '#555';
+          html += `<div class="row ${live?'':'stale'}">`
+                + `<span class="sd" style="background:${sd}"></span>`
+                + `<span class="id mono">#${d.sysid}</span>`
+                + `<span class="mono">${d.alt_m} m</span>`
+                + `<span class="rd mono">${d.speed_ms} m/s</span></div>`;
+        });
+      });
+      document.getElementById('fleets').innerHTML = html;
+    }
+
+    async function poll(){
+      try{
+        const r = await fetch('/api/drones', {cache:'no-store'});
+        const data = await r.json();
+        updateDrones(data); updatePanel(data);
+      }catch(e){
+        document.getElementById('status').textContent = 'aggregator offline — retrying';
+      }
+    }
+    poll();
+    setInterval(poll, 1000);
+  </script>
+</body>
+</html>
