@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Frisco UTM — Drone Traffic Monitor</title>
+<!-- MapLibre GL JS replaces Leaflet here. It renders on WebGL (Leaflet uses plain
+     DOM/Canvas), and it doesn't ship a default "add a slippy tile layer" helper
+     the way Leaflet's L.tileLayer does — instead you hand it a full "style"
+     object describing sources + layers, which we build below in the script. -->
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" />
+<style>
+  :root{
+    --bg:#0b0f14; --panel:#0f151d; --panel-2:#141c26;
+    --line:#1f2a36; --text:#e6edf3; --muted:#8b949e;
+    --live:#3fb950;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:var(--bg); color:var(--text);
+    font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+    overflow:hidden;
+  }
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+
+  #map{position:absolute; inset:0 0 0 320px; background:var(--bg)}
+
+  /* ---- control-board side panel ---- */
+  #panel{
+    position:absolute; top:0; left:0; bottom:0; width:320px;
+    background:var(--panel); border-right:1px solid var(--line);
+    display:flex; flex-direction:column; z-index:1000;
+  }
+  .head{padding:16px 18px 14px; border-bottom:1px solid var(--line)}
+  .title{font-size:18px; font-weight:700; letter-spacing:.5px}
+  .sub{font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:2px; margin-top:2px}
+  .live{display:flex; align-items:center; gap:7px; margin-top:10px; font-size:12px; color:var(--muted)}
+  .dot{width:8px; height:8px; border-radius:50%; background:var(--live); box-shadow:0 0 8px var(--live)}
+  .dot.pulse{animation:pulse 1.6s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+  .totals{display:flex; gap:10px; padding:14px 18px; border-bottom:1px solid var(--line)}
+  .stat{flex:1; background:var(--panel-2); border:1px solid var(--line); border-radius:8px; padding:10px 12px}
+  .stat .n{font-size:22px; font-weight:700}
+  .stat .l{font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:1px}
+
+  .fleets{flex:1; overflow-y:auto; padding:6px 0}
+  .co{padding:12px 18px 6px; display:flex; align-items:center; gap:8px}
+  .co .swatch{width:10px; height:10px; border-radius:2px}
+  .co .name{font-weight:600; font-size:13px}
+  .co .ct{margin-left:auto; font-size:11px; color:var(--muted)}
+  .row{
+    display:grid; grid-template-columns:14px 34px 1fr auto; gap:8px; align-items:center;
+    padding:5px 18px; font-size:12px;
+  }
+  .row .sd{width:8px; height:8px; border-radius:50%}
+  .row .id{color:var(--muted)}
+  .row .rd{color:var(--muted); font-size:11px; text-align:right}
+  .row.stale{opacity:.45}
+
+  .legend{border-top:1px solid var(--line); padding:12px 18px; font-size:11px; color:var(--muted)}
+  .legend div{display:flex; align-items:center; gap:8px; margin:4px 0}
+  .legend .k{width:14px; text-align:center}
+
+  /* ---- drone markers ---- */
+  /* .drone-icon was a Leaflet-only wrapper class for L.divIcon; MapLibre
+     markers use your element directly with no extra wrapper, so this rule
+     is no longer applied anywhere. Left in case you want it back. */
+  .drone-icon{background:none; border:none}
+  .drone{position:relative; width:30px; height:30px}
+  /* The tether is the thin line connecting a "lifted" drone back down to its
+     true ground point (see altitudePixelLift() in the script). Its height is
+     driven by the --lift custom property, which JS sets per-drone per-frame
+     since it depends on that drone's altitude, the current zoom, and the
+     current camera pitch. It's anchored at the CENTER of the .drone box
+     (same point Marker uses for lng/lat) and grows straight down by --lift
+     pixels — exactly undoing the upward pixel offset applied to the marker,
+     so the bottom tip of the tether always lands back on the real ground
+     coordinate regardless of tilt/zoom. */
+  .drone .tether{
+    position:absolute; left:50%; top:50%; width:1px;
+    height:var(--lift, 0px);
+    background:var(--c); opacity:.55;
+  }
+  .drone .arrow{
+    position:absolute; left:50%; top:50%; width:0; height:0;
+    border-left:7px solid transparent; border-right:7px solid transparent;
+    border-bottom:15px solid var(--c);
+    transform-origin:50% 70%; translate:-50% -65%;
+    filter:drop-shadow(0 0 4px var(--c));
+  }
+  .drone.stale .arrow{filter:none; opacity:.5}
+  .drone.ring::before{
+    content:""; position:absolute; left:50%; top:50%;
+    width:26px; height:26px; margin:-13px 0 0 -13px;
+    border:1.5px solid var(--c); border-radius:50%; opacity:.7;
+  }
+  .drone .tag{
+    position:absolute; left:19px; top:16px;
+    font:600 10px ui-monospace,monospace; color:var(--text);
+    text-shadow:0 0 3px #000,0 0 3px #000; white-space:nowrap;
+  }
+  .depot{
+    width:14px; height:14px; transform:rotate(45deg);
+    border:2px solid var(--c); background:rgba(0,0,0,.4);
+  }
+  .depot-wrap{position:relative}
+  .depot-wrap .dlabel{
+    position:absolute; left:18px; top:0; font:600 11px system-ui;
+    color:var(--c); text-shadow:0 0 4px #000; white-space:nowrap;
+  }
+  @media (prefers-reduced-motion: reduce){ .dot.pulse{animation:none} }
+</style>
+</head>
+<body>
+  <div id="panel">
+    <div class="head">
+      <div class="title">FRISCO UTM</div>
+      <div class="sub">UAS Traffic Management</div>
+      <div class="live"><span class="dot pulse"></span><span id="status">connecting…</span></div>
+    </div>
+    <div class="totals">
+      <div class="stat"><div class="n" id="t-active">0</div><div class="l">Active</div></div>
+      <div class="stat"><div class="n" id="t-total">0</div><div class="l">Tracked</div></div>
+    </div>
+    <div class="fleets" id="fleets"></div>
+    <div class="legend">
+      <div><span class="k">▲</span> drone (arrow = heading)</div>
+      <div><span class="k">◯</span> ringed = real autopilot (SITL)</div>
+      <div><span class="k">◆</span> company depot</div>
+    </div>
+  </div>
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+  <script>
+    // ------------------------------------------------------------------
+    // MAP SETUP
+    // ------------------------------------------------------------------
+    // MapLibre has no built-in "L.tileLayer(url)" shortcut like Leaflet.
+    // Instead the whole basemap is described as a "style": a set of raster
+    // tile *sources* plus *layers* that draw from them. We hand-build a
+    // minimal style here that points at the same CARTO dark tiles as before,
+    // using all 4 CARTO subdomains (a/b/c/d) since MapLibre doesn't have
+    // Leaflet's automatic {s} subdomain round-robin — we just list them all.
+    const map = new maplibregl.Map({
+      container: 'map',
+      style: {
+        version: 8,
+        sources: {
+          'carto-dark': {
+            type: 'raster',
+            // NOTE: Leaflet's tile URLs used a "{r}" token that Leaflet itself
+            // substituted with "@2x" (or "") for retina screens. MapLibre does
+            // NOT know about "{r}" — it has no automatic retina substitution,
+            // so leaving "{r}" in the URL meant every tile request was a
+            // literal (and 404-ing) URL like ".../256{r}.png", and the map
+            // never showed any basemap at all. Plain, no-token URLs fix it.
+            tiles: [
+              'https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
+              'https://b.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
+              'https://c.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
+              'https://d.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
+            ],
+            tileSize: 256,
+            attribution: '&copy; OpenStreetMap &copy; CARTO',
+          },
+        },
+        layers: [
+          { id: 'carto-dark-layer', type: 'raster', source: 'carto-dark' },
+        ],
+      },
+      // IMPORTANT: MapLibre (like all WebGL map libraries derived from
+      // Mapbox GL) takes coordinates as [lng, lat] — the OPPOSITE order
+      // from Leaflet's [lat, lng]. Every coordinate pair below has been
+      // flipped to match.
+      center: [-96.823, 33.150],
+      zoom: 12,
+      // --- 3D CAMERA ---
+      // Leaflet is a strictly flat, top-down 2D map — it has no concept of
+      // camera tilt. MapLibre's camera can be pitched (tilted) and rotated,
+      // which is what actually makes a map feel "3D": pitch:0 looks straight
+      // down (like Leaflet); pitch:60 looks at the map from an angle, the
+      // way you'd view a physical terrain model. maxPitch raises the default
+      // ceiling (60°) so users can tilt further if they drag it themselves.
+      pitch: 55,
+      bearing: -20,
+      maxPitch: 85,
+      attributionControl: true,
+    });
+
+    // Leaflet's L.map({zoomControl:true}) added +/- buttons automatically;
+    // MapLibre requires adding that control explicitly. visualizePitch adds
+    // a tilt-reset button/indicator alongside zoom, since pitch is new here.
+    map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'top-right');
+
+    // Surfaces any tile-loading or style errors in the console — MapLibre
+    // fails silently (just shows a blank/grey map) otherwise, which is hard
+    // to debug. Open devtools (F12) and check here if the basemap is missing.
+    map.on('error', (e) => console.error('[maplibre]', e.error));
+
+    // A cheap, no-extra-data way to make a tilted map feel less flat: a
+    // gradient "sky" layer along the horizon. Purely atmospheric — it
+    // doesn't need terrain/elevation data, just a tilted camera to be
+    // visible at all (at pitch 0 you're looking straight down, so there's
+    // no horizon to show it on).
+    map.on('load', () => {
+      // The 'sky' layer type (not a map.setSky() method — that's a
+      // Mapbox-only API) needs to be added like any other style layer.
+      // Wrapped in try/catch since sky support varies slightly across
+      // MapLibre versions and shouldn't be able to break the rest of the map.
+      try {
+        map.addLayer({
+          id: 'sky',
+          type: 'sky',
+          paint: {
+            'sky-type': 'gradient',
+            'sky-gradient': [
+              'interpolate', ['linear'], ['sky-radial-progress'],
+              0.0, '#1f2a36',
+              0.7, '#0f151d',
+              1.0, '#0b0f14',
+            ],
+            'sky-gradient-radius': 90,
+          },
+        });
+      } catch (err) {
+        console.warn('[maplibre] sky layer not supported, skipping', err);
+      }
+    });
+
+    const droneMarkers = {}, trailPoints = {}, tooltipPopups = {}, lastDroneData = {};
+    let depotsDrawn = false;
+    const TRAIL_MAX = 80;
+
+    // MapLibre doesn't render anything (and rejects addSource/addLayer calls)
+    // until the style has finished loading, so we gate all our drone/trail
+    // drawing behind this flag and the 'load' event below.
+    let mapReady = false;
+    map.on('load', () => { mapReady = true; });
+
+    // --- ALTITUDE VISUALIZATION ---
+    // MapLibre's Marker positions by [lng, lat] only — it has no concept of
+    // a third "altitude" dimension for a plain HTML marker (that would need
+    // a full custom WebGL layer). Instead we FAKE height by nudging the
+    // marker upward on screen: more altitude, more pixels up. This is only
+    // visible once the camera is pitched (tilted) — at pitch 0 (straight
+    // down) "up on screen" and "toward the camera" aren't distinguishable
+    // from "further away," so lifting markers wouldn't read as height.
+    // That's exactly the earlier symptom: with pitch 0, every drone's trail
+    // and marker sit on the same flat plane, so the trail is always drawn
+    // right up against (and hidden under) the drone.
+    const ALTITUDE_EXAGGERATION = 6; // visual multiplier so ~100m drones are clearly readable
+    function altitudePixelLift(alt_m, lat){
+      const zoom = map.getZoom();
+      const pitchRad = map.getPitch() * Math.PI / 180;
+      // Standard Web Mercator meters-per-pixel formula (accounts for zoom + latitude).
+      const metersPerPixel = 156543.03392 * Math.cos(lat * Math.PI / 180) / Math.pow(2, zoom);
+      // sin(pitch): at pitch 0 (top-down) this is 0 — no lift, correctly
+      // matching a flat view. As you tilt further, more of the vertical
+      // "up in the air" distance projects onto vertical screen pixels.
+      return (alt_m / metersPerPixel) * Math.sin(pitchRad) * ALTITUDE_EXAGGERATION;
+    }
+
+    // Builds the little colored arrow + sysid tag as a plain DOM element.
+    // Leaflet used L.divIcon (an icon *description* Leaflet turns into DOM
+    // for you); MapLibre's Marker instead just takes a real HTMLElement
+    // that you build and hand it directly, which we do here.
+    function droneElement(d){
+      const hdg = (d.hdg==null) ? 0 : d.hdg;
+      const ring = d.kind === 'SITL' ? 'ring' : '';
+      const el = document.createElement('div');
+      el.className = `drone ${d.status} ${ring}`;
+      el.style.setProperty('--c', d.color);
+      el.innerHTML =
+        `<div class="tether"></div>
+         <div class="arrow" style="transform:rotate(${hdg}deg)"></div>
+         <div class="tag">${d.sysid}</div>`;
+      return el;
+    }
+
+    // Refreshes an *existing* drone element in place (status/ring classes,
+    // heading rotation, color). We don't need MapLibre's equivalent of
+    // setIcon() because we kept a direct reference to the real DOM element.
+    function updateDroneElement(el, d){
+      const hdg = (d.hdg==null) ? 0 : d.hdg;
+      const ring = d.kind === 'SITL' ? 'ring' : '';
+      el.className = `drone ${d.status} ${ring}`;
+      el.style.setProperty('--c', d.color);
+      el.querySelector('.arrow').style.transform = `rotate(${hdg}deg)`;
+    }
+
+    function tip(d){
+      const h = d.hdg==null ? '—' : d.hdg.toFixed(0)+'°';
+      return `<b style="color:${d.color}">${d.company} · #${d.sysid}</b><br>`
+           + `<span class="mono">alt ${d.alt_m} m &nbsp; ${d.speed_ms} m/s &nbsp; ${h}</span>`
+           + (d.status==='stale' ? '<br><i>signal lost</i>' : '');
+    }
+
+    function drawDepots(depots){
+      depots.forEach(p=>{
+        // Same idea as droneElement: a plain DOM node instead of an L.divIcon.
+        const el = document.createElement('div');
+        el.className = 'depot-wrap';
+        el.innerHTML =
+          `<div class="depot" style="--c:${p.color}"></div>
+           <div class="dlabel" style="--c:${p.color}">${p.company} depot</div>`;
+        // Depots don't move and aren't clickable, so a plain Marker
+        // (no popup, no drag) is enough — MapLibre markers are
+        // non-interactive by default unless you add a popup/listener.
+        // anchor:'center' matches the original Leaflet iconAnchor of [7,7]
+        // (the middle of the 14x14 diamond) — the label is absolutely
+        // positioned off to the side, so it doesn't affect the anchor point.
+        new maplibregl.Marker({element: el, anchor: 'center'})
+          .setLngLat([p.lon, p.lat])
+          .addTo(map);
+      });
+    }
+
+    // Creates (once) or updates the fading GeoJSON "trail" line behind a
+    // drone. Leaflet had a first-class L.polyline object with .setLatLngs();
+    // MapLibre only draws from GeoJSON *sources* via a separate line
+    // *layer*, so a trail is really a source+layer pair we manage by id.
+    function updateTrail(d, lngLat){
+      const id = 'trail-' + d.sysid;
+      if(!trailPoints[d.sysid]) trailPoints[d.sysid] = [];
+      const pts = trailPoints[d.sysid];
+      pts.push(lngLat);
+      if(pts.length > TRAIL_MAX) pts.shift();
+
+      const geojson = {
+        type: 'Feature',
+        geometry: { type: 'LineString', coordinates: pts },
+      };
+
+      if(map.getSource(id)){
+        // Source already exists — just push new coordinates into it.
+        map.getSource(id).setData(geojson);
+      } else {
+        map.addSource(id, { type: 'geojson', data: geojson });
+        map.addLayer({
+          id,
+          type: 'line',
+          source: id,
+          paint: {
+            'line-color': d.color,
+            'line-width': 2,
+            'line-opacity': 0.45,
+          },
+        });
+      }
+    }
+
+    function removeTrail(sid){
+      const id = 'trail-' + sid;
+      // Layers must be removed before the source they draw from.
+      if(map.getLayer(id)) map.removeLayer(id);
+      if(map.getSource(id)) map.removeSource(id);
+      delete trailPoints[sid];
+    }
+
+    function updateDrones(data){
+      if(!mapReady) return; // wait for the style to finish loading first
+      if(!depotsDrawn && data.depots){ drawDepots(data.depots); depotsDrawn = true; }
+      const seen = new Set();
+      data.drones.forEach(d=>{
+        seen.add(d.sysid);
+        const lngLat = [d.lon, d.lat]; // MapLibre order, see note above
+        lastDroneData[d.sysid] = d; // remembered so we can re-lift on zoom/pitch changes below
+
+        updateTrail(d, lngLat);
+
+        if(!droneMarkers[d.sysid]){
+          const el = droneElement(d);
+          const marker = new maplibregl.Marker({element: el, anchor: 'center'})
+            .setLngLat(lngLat)
+            .addTo(map);
+
+          // MapLibre has no bindTooltip(); we emulate Leaflet's "hover
+          // tooltip" with a Popup that we open/close on mouseenter/leave
+          // instead of the default click-to-toggle behavior.
+          const popup = new maplibregl.Popup({
+            offset: 16, closeButton: false, closeOnClick: false,
+          });
+          el.addEventListener('mouseenter', () => {
+            popup.setLngLat(marker.getLngLat()).setHTML(tip(d)).addTo(map);
+          });
+          el.addEventListener('mouseleave', () => popup.remove());
+
+          droneMarkers[d.sysid] = marker;
+          tooltipPopups[d.sysid] = popup;
+        }
+
+        const m = droneMarkers[d.sysid];
+        m.setLngLat(lngLat);
+        updateDroneElement(m.getElement(), d);
+        liftDroneMarker(m, d);
+        // Keep an open popup's content/position fresh if the mouse is
+        // still hovering when new data arrives.
+        if(tooltipPopups[d.sysid].isOpen()){
+          tooltipPopups[d.sysid].setLngLat(lngLat).setHTML(tip(d));
+        }
+      });
+
+      // drop markers/trails for drones that vanished entirely
+      Object.keys(droneMarkers).forEach(sid=>{
+        if(!seen.has(+sid)){
+          droneMarkers[sid].remove();
+          delete droneMarkers[sid];
+          tooltipPopups[sid].remove();
+          delete tooltipPopups[sid];
+          removeTrail(sid);
+          delete lastDroneData[sid];
+        }
+      });
+    }
+
+    // Applies the fake-3D altitude lift to one marker: shifts it up on
+    // screen via Marker.setOffset() (pixel offset, unaffected by anchor),
+    // and sets the matching --lift CSS variable so the .tether line drawn
+    // inside the element reaches back down the same distance to the real
+    // ground coordinate. Called both on fresh telemetry and whenever the
+    // camera's zoom/pitch changes (see the map event listeners below),
+    // since the pixel-per-meter math depends on both.
+    function liftDroneMarker(marker, d){
+      const px = altitudePixelLift(d.alt_m, d.lat);
+      marker.setOffset([0, -px]);
+      marker.getElement().style.setProperty('--lift', px + 'px');
+    }
+
+    // Re-applies the lift for every currently-shown drone. Bound to the
+    // map's own zoom/pitch/rotate events so tilting or zooming between
+    // telemetry polls (which only arrive once a second) still feels live,
+    // rather than waiting up to a second to "catch up."
+    function relift(){
+      Object.keys(droneMarkers).forEach(sid=>{
+        const d = lastDroneData[sid];
+        if(d) liftDroneMarker(droneMarkers[sid], d);
+      });
+    }
+    map.on('zoom', relift);
+    map.on('pitch', relift);
+
+    function updatePanel(data){
+      document.getElementById('t-active').textContent = data.counts.active;
+      document.getElementById('t-total').textContent  = data.counts.total;
+      const when = new Date(data.updated*1000).toLocaleTimeString();
+      document.getElementById('status').textContent = 'live · updated '+when;
+
+      const byCo = {};
+      data.drones.forEach(d=>{ (byCo[d.company]=byCo[d.company]||[]).push(d); });
+
+      let html = '';
+      Object.keys(data.colors).forEach(co=>{
+        const list = (byCo[co]||[]).sort((a,b)=>a.sysid-b.sysid);
+        const color = data.colors[co];
+        html += `<div class="co"><span class="swatch" style="background:${color}"></span>`
+              + `<span class="name">${co}</span><span class="ct">${list.length} aircraft</span></div>`;
+        list.forEach(d=>{
+          const live = d.status==='active';
+          const sd = live ? color : '#555';
+          html += `<div class="row ${live?'':'stale'}">`
+                + `<span class="sd" style="background:${sd}"></span>`
+                + `<span class="id mono">#${d.sysid}</span>`
+                + `<span class="mono">${d.alt_m} m</span>`
+                + `<span class="rd mono">${d.speed_ms} m/s</span></div>`;
+        });
+      });
+      document.getElementById('fleets').innerHTML = html;
+    }
+
+    async function poll(){
+      try{
+        const r = await fetch('/api/drones', {cache:'no-store'});
+        const data = await r.json();
+        // updateDrones() itself checks mapReady and just returns early if the
+        // MapLibre style hasn't finished loading yet, so it's safe to always
+        // call it — the sidebar (updatePanel) doesn't depend on the map at all.
+        updateDrones(data); updatePanel(data);
+      }catch(e){
+        document.getElementById('status').textContent = 'aggregator offline — retrying';
+      }
+    }
+    poll();
+    setInterval(poll, 1000);
+  </script>
+</body>
+</html>
