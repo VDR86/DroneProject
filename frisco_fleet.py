@@ -48,8 +48,9 @@ DEPOTS = {
 # the UTM can show altitude separation between the two operators.
 CRUISE_ALT_M = {"Wing": 80.0, "Zipline": 110.0}
 
-# Company display colours (used later by the map; kept here as the source of truth).
-COMPANY_COLOR = {"Wing": "#1E88E5", "Zipline": "#E53935"}  # blue / red
+# Company display colours (used everywhere via the JSON; single source of truth).
+# Zipline is yellow so it doesn't clash with the red no-fly zones.
+COMPANY_COLOR = {"Wing": "#1E88E5", "Zipline": "#FDD835"}  # blue / yellow
 
 # Where the UTM map should centre its initial view (central Frisco).
 MAP_CENTER = (33.150, -96.823)
@@ -79,6 +80,40 @@ DELIVERY_POINTS = [
     (33.1700, -96.8250),  # scattered N-central
     (33.1400, -96.7950),  # scattered E
 ]
+
+# Areas of operation: one polygon per company, drawn dotted in the company colour.
+# Each polygon contains that company's depot AND all delivery points; Wing's leans
+# west to its depot, Zipline's leans east to its depot (they overlap in the middle).
+# Coordinates are (lat, lon), listed around the boundary.
+AREAS_OF_OPERATION = {
+    "Wing": [
+        (33.226, -96.788), (33.226, -96.862), (33.160, -96.886),
+        (33.086, -96.860), (33.086, -96.788),
+    ],
+    "Zipline": [
+        (33.222, -96.864), (33.222, -96.770), (33.150, -96.752),
+        (33.086, -96.770), (33.086, -96.864),
+    ],
+}
+
+# AO label placement: pinned to a fixed corner of each AO — Wing top-right,
+# Zipline bottom-left — so the two are diagonal opposites and never overlap.
+# 'dir' is which way the text runs from that corner.
+AO_LABEL = {
+    "Wing":    {"lat": 33.226, "lon": -96.788, "dir": "right"},  # top-right corner
+    "Zipline": {"lat": 33.086, "lon": -96.864, "dir": "left"},   # bottom-left corner
+}
+
+# No-fly zones (circles), placed JUST OUTSIDE the AO boundaries so a real drone can
+# be flown into them by hand for the demo. Coordinates are illustrative Frisco spots.
+NO_FLY_ZONES = [
+    {"name": "Medical helipad", "lat": 33.1800, "lon": -96.8950, "radius_m": 800},
+    {"name": "School zone",     "lat": 33.1150, "lon": -96.7520, "radius_m": 700},
+]
+
+# Altitude limits for the UTM (metres above ground). 400 ft ceiling, 10 m floor.
+MAX_ALT_M = 122.0   # ~400 ft
+MIN_ALT_M = 10.0
 
 # Flight model parameters.
 SPEED_MS = 15.0      # cruise ground speed
@@ -129,6 +164,7 @@ class SimDrone:
         self.target = self._pick_delivery()
         self.hover_until = 0.0
         self.vx = self.vy = self.vz = 0.0   # cm/s for telemetry
+        self.battery = 100.0                # % — drains flying, tops up at depot
 
         # Its own MAVLink link, stamped with this drone's system id.
         self.conn = mavutil.mavlink_connection(
@@ -156,6 +192,13 @@ class SimDrone:
         return False
 
     def update(self, now):
+        # Battery: drains while doing anything airborne, recharges at the depot
+        # ("rest") as if the drone swapped/charged its pack between deliveries.
+        if self.phase == "rest":
+            self.battery = min(100.0, self.battery + 3.0)
+        else:
+            self.battery = max(10.0, self.battery - 0.06)
+
         if self.phase in ("to_delivery", "to_depot"):
             # Climb toward cruise altitude WHILE flying to the target (drones
             # don't sit still gaining height - they transit and climb together).
@@ -185,8 +228,18 @@ class SimDrone:
                 mavutil.mavlink.MAV_AUTOPILOT_ARDUPILOTMEGA,
                 mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED |
                 mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED,
-                3,  # custom_mode: AUTO-ish
+                3,  # custom_mode: AUTO-ish (these fly delivery "missions")
                 mavutil.mavlink.MAV_STATE_ACTIVE)
+
+            # Battery report. Voltage tracks the % between ~10.5 V and 12.6 V (3S).
+            bit = mavutil.mavlink.MAV_SYS_STATUS_SENSOR_BATTERY
+            volt_mv = int(10500 + (self.battery / 100.0) * (12600 - 10500))
+            self.conn.mav.sys_status_send(
+                bit, bit, bit,      # sensors present / enabled / healthy
+                500,                # CPU load 50.0%
+                volt_mv, -1,        # battery voltage (mV), current (unknown)
+                int(self.battery),  # battery remaining %
+                0, 0, 0, 0, 0, 0)
 
         self.conn.mav.global_position_int_send(
             boot_ms,

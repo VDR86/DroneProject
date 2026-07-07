@@ -80,16 +80,53 @@
     font:600 10px ui-monospace,monospace; color:var(--text);
     text-shadow:0 0 3px #000,0 0 3px #000; white-space:nowrap;
   }
+  .drone.alert::after{
+    content:""; position:absolute; left:50%; top:50%;
+    width:30px; height:30px; margin:-15px 0 0 -15px; border-radius:50%;
+    border:2px solid #ff4d4d; animation:ping 1.2s ease-out infinite;
+  }
+  @keyframes ping{0%{transform:scale(.55);opacity:.9}100%{transform:scale(2.3);opacity:0}}
+  .deliv-badge{
+    font:700 11px system-ui; color:#3fdc7a; white-space:nowrap;
+    text-shadow:0 0 6px #000,0 0 6px #000;
+    animation:deliv 3s ease-out forwards;
+  }
+  @keyframes deliv{
+    0%{opacity:0; transform:translateY(5px) scale(.9)}
+    15%{opacity:1; transform:translateY(0) scale(1)}
+    70%{opacity:1; transform:translateY(-7px)}
+    100%{opacity:0; transform:translateY(-18px)}
+  }
   .depot{
     width:14px; height:14px; transform:rotate(45deg);
     border:2px solid var(--c); background:rgba(0,0,0,.4);
   }
-  .depot-wrap{position:relative}
-  .depot-wrap .dlabel{
-    position:absolute; left:18px; top:0; font:600 11px system-ui;
-    color:var(--c); text-shadow:0 0 4px #000; white-space:nowrap;
-  }
-  @media (prefers-reduced-motion: reduce){ .dot.pulse{animation:none} }
+  .maplabel{font:600 11px system-ui; text-shadow:0 0 5px #000,0 0 5px #000;
+    white-space:nowrap; box-sizing:border-box}
+  .maplabel.ao{font-weight:700; letter-spacing:1px; opacity:.92}
+  .maplabel.nfz{color:#ff8a8a; font-size:10px}
+  @media (prefers-reduced-motion: reduce){ .dot.pulse{animation:none} .drone.alert::after{animation:none} }
+
+  /* ---- alerts sidebar ---- */
+  .alerts{border-bottom:1px solid var(--line); padding:12px 18px}
+  .al-head{font-size:11px; letter-spacing:1px; color:var(--muted); text-transform:uppercase;
+    display:flex; align-items:center; gap:8px; margin-bottom:8px}
+  .al-count{min-width:20px; height:18px; border-radius:9px; background:var(--panel-2);
+    color:var(--muted); font:600 11px ui-monospace,monospace; display:inline-flex;
+    align-items:center; justify-content:center; padding:0 6px}
+  .al-count.on{background:#ff4d4d; color:#fff}
+  .al-none{font-size:12px; color:var(--muted); opacity:.6}
+  .al-row{display:grid; grid-template-columns:9px 34px 1fr; gap:8px; align-items:center;
+    padding:4px 0; font-size:12px}
+  .al-row .sd{width:8px; height:8px; border-radius:50%}
+  .al-row .id{color:var(--muted); font-family:ui-monospace,monospace}
+  .al-row .msg{color:#ff8a8a}
+  .al-log{margin-top:9px; border-top:1px dashed var(--line); padding-top:7px;
+    display:flex; flex-direction:column; gap:3px}
+  .ev{font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .ev-enter{color:#ff8a8a}
+  .ev-clear{color:#6ecf8e}
+  .ev .t{color:var(--muted); opacity:.55}
 </style>
 </head>
 <body>
@@ -102,12 +139,16 @@
     <div class="totals">
       <div class="stat"><div class="n" id="t-active">0</div><div class="l">Active</div></div>
       <div class="stat"><div class="n" id="t-total">0</div><div class="l">Tracked</div></div>
+      <div class="stat"><div class="n" id="t-deliv">0</div><div class="l">Delivered</div></div>
     </div>
+    <div class="alerts" id="alerts"></div>
     <div class="fleets" id="fleets"></div>
     <div class="legend">
       <div><span class="k">▲</span> drone (arrow = heading)</div>
       <div><span class="k">◯</span> ringed = real autopilot (SITL)</div>
       <div><span class="k">◆</span> company depot</div>
+      <div><span class="k">⬡</span> area of operations (dotted)</div>
+      <div><span class="k" style="color:#ff5a5a">⛔</span> no-fly zone</div>
     </div>
   </div>
   <div id="map"></div>
@@ -121,14 +162,25 @@
     }).addTo(map);
 
     const droneMarkers = {}, trails = {};
+    const shownDelivery = {};   // sysid -> last delivery ts we've already popped
+    let firstDeliveryScan = true;
     let depotsDrawn = false;
+    let zonesDrawn = false;
     const TRAIL_MAX = 80;
+
+    function popDelivered(d){
+      const m = L.marker([d.lat,d.lon], {interactive:false, zIndexOffset:1000,
+        icon:L.divIcon({className:'', iconSize:[110,16], iconAnchor:[55,28],
+          html:`<div class="deliv-badge">✓ Delivered</div>`})}).addTo(map);
+      setTimeout(()=>{ map.removeLayer(m); }, 3200);
+    }
 
     function droneIcon(d){
       const hdg = (d.hdg==null) ? 0 : d.hdg;
       const ring = d.kind === 'SITL' ? 'ring' : '';
+      const alert = d.alert ? 'alert' : '';
       const html =
-        `<div class="drone ${d.status} ${ring}" style="--c:${d.color}">
+        `<div class="drone ${d.status} ${ring} ${alert}" style="--c:${d.color}">
            <div class="arrow" style="transform:rotate(${hdg}deg)"></div>
            <div class="tag">${d.sysid}</div>
          </div>`;
@@ -137,22 +189,58 @@
 
     function tip(d){
       const h = d.hdg==null ? '—' : d.hdg.toFixed(0)+'°';
+      const mode = d.mode || '—';
+      const batt = (d.battery==null) ? '—' : d.battery+'%';
       return `<b style="color:${d.color}">${d.company} · #${d.sysid}</b><br>`
-           + `<span class="mono">alt ${d.alt_m} m &nbsp; ${d.speed_ms} m/s &nbsp; ${h}</span>`
+           + `<span class="mono">alt ${d.alt_m} m &nbsp; ${d.speed_ms} m/s &nbsp; ${h}</span><br>`
+           + `<span class="mono">${mode} &nbsp; batt ${batt}</span>`
+           + ((d.alerts && d.alerts.length) ? '<br><span style="color:#ff6b6b">⚠ '+d.alerts.join('<br>⚠ ')+'</span>' : '')
            + (d.status==='stale' ? '<br><i>signal lost</i>' : '');
     }
 
-    function drawDepots(depots){
-      depots.forEach(p=>{
-        const icon = L.divIcon({className:'', iconSize:[14,14], iconAnchor:[7,7],
-          html:`<div class="depot-wrap"><div class="depot" style="--c:${p.color}"></div>`
-              + `<div class="dlabel" style="--c:${p.color}">${p.company} depot</div></div>`});
-        L.marker([p.lat,p.lon],{icon, interactive:false}).addTo(map);
+    // Place a non-interactive text label beside a point.
+    // dir: 'right'/'left' (extends E/W), 'below'/'above', or 'center'. Fixed pixel size.
+    function textLabel(latlng, text, extraCls, color, dir){
+      const W = 150, H = 16, g = 12, v = 15;
+      let anchor, align = 'center', pad = '';
+      if(dir === 'left'){ anchor = [W, H/2]; align = 'right'; pad = `padding-right:${g}px`; }
+      else if(dir === 'right'){ anchor = [0, H/2]; align = 'left'; pad = `padding-left:${g}px`; }
+      else if(dir === 'below'){ anchor = [W/2, -v]; }
+      else if(dir === 'above'){ anchor = [W/2, H + v]; }
+      else { anchor = [W/2, H/2]; }   // center
+      const style = `width:${W}px; text-align:${align}; ${pad}; ${color ? 'color:'+color : ''}`;
+      return L.marker(latlng, {interactive:false, icon:L.divIcon({className:'',
+        iconSize:[W,H], iconAnchor:anchor,
+        html:`<div class="maplabel ${extraCls}" style="${style}">${text}</div>`})});
+    }
+
+    function drawDepots(data){
+      data.depots.forEach(p=>{
+        L.marker([p.lat,p.lon], {interactive:false, icon:L.divIcon({className:'',
+          iconSize:[14,14], iconAnchor:[7,7],
+          html:`<div class="depot" style="--c:${p.color}"></div>`})}).addTo(map);
+        // Label centered horizontally beneath the depot.
+        textLabel([p.lat,p.lon], `${p.company} depot`, 'depot', p.color, 'below').addTo(map);
+      });
+    }
+
+    function drawZones(data){
+      (data.areas||[]).forEach(a=>{
+        L.polygon(a.polygon, {color:a.color, weight:2, dashArray:'6 7',
+          fill:false, interactive:false}).addTo(map);
+        // Label pinned to a fixed AO corner (Wing top-right, Zipline bottom-left).
+        textLabel(a.label, `${a.company.toUpperCase()} AO`, 'ao', a.color, a.label_dir).addTo(map);
+      });
+      (data.nofly||[]).forEach(z=>{
+        L.circle([z.lat,z.lon], {radius:z.radius_m, color:'#ff5a5a', weight:1.5,
+          fillColor:'#ff5a5a', fillOpacity:0.12, interactive:false}).addTo(map);
+        textLabel([z.lat,z.lon], `⛔ ${z.name}`, 'nfz', null, 'center').addTo(map);
       });
     }
 
     function updateDrones(data){
-      if(!depotsDrawn && data.depots){ drawDepots(data.depots); depotsDrawn = true; }
+      if(!zonesDrawn && data.areas){ drawZones(data); zonesDrawn = true; }
+      if(!depotsDrawn && data.depots){ drawDepots(data); depotsDrawn = true; }
       const seen = new Set();
       data.drones.forEach(d=>{
         seen.add(d.sysid);
@@ -180,11 +268,23 @@
           if(trails[sid]){ map.removeLayer(trails[sid]); delete trails[sid]; }
         }
       });
+
+      // delivery pops: fire once per new delivery (skip whatever already happened on load)
+      data.drones.forEach(d=>{
+        if(!d.delivered_ts) return;
+        if(firstDeliveryScan){ shownDelivery[d.sysid] = d.delivered_ts; return; }
+        if(shownDelivery[d.sysid] !== d.delivered_ts){
+          shownDelivery[d.sysid] = d.delivered_ts;
+          popDelivered(d);
+        }
+      });
+      firstDeliveryScan = false;
     }
 
     function updatePanel(data){
       document.getElementById('t-active').textContent = data.counts.active;
       document.getElementById('t-total').textContent  = data.counts.total;
+      document.getElementById('t-deliv').textContent  = data.deliveries || 0;
       const when = new Date(data.updated*1000).toLocaleTimeString();
       document.getElementById('status').textContent = 'live · updated '+when;
 
@@ -210,11 +310,39 @@
       document.getElementById('fleets').innerHTML = html;
     }
 
+    function updateAlerts(data){
+      const active = [];
+      data.drones.forEach(d => (d.alerts||[]).forEach(m => active.push({d, m})));
+      let html = `<div class="al-head">Alerts`
+               + `<span class="al-count ${active.length?'on':''}">${active.length}</span></div>`;
+      if(active.length === 0){
+        html += `<div class="al-none">no active alerts</div>`;
+      } else {
+        active.forEach(a=>{
+          html += `<div class="al-row"><span class="sd" style="background:${a.d.color}"></span>`
+                + `<span class="id">#${a.d.sysid}</span>`
+                + `<span class="msg">${a.m}</span></div>`;
+        });
+      }
+      const ev = (data.notifications||[]).slice(0,6);
+      if(ev.length){
+        html += `<div class="al-log">`;
+        ev.forEach(n=>{
+          const icon = n.kind==='enter' ? '⚠' : '✓';
+          const cls  = n.kind==='enter' ? 'ev-enter' : 'ev-clear';
+          html += `<div class="ev ${cls}">${icon} #${n.sysid} ${n.text} `
+                + `<span class="t">${Math.round(n.ago_s)}s</span></div>`;
+        });
+        html += `</div>`;
+      }
+      document.getElementById('alerts').innerHTML = html;
+    }
+
     async function poll(){
       try{
         const r = await fetch('/api/drones', {cache:'no-store'});
         const data = await r.json();
-        updateDrones(data); updatePanel(data);
+        updateDrones(data); updatePanel(data); updateAlerts(data);
       }catch(e){
         document.getElementById('status').textContent = 'aggregator offline — retrying';
       }

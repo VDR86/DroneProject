@@ -23,6 +23,7 @@ import math
 import os
 import threading
 import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 os.environ["MAVLINK20"] = "1"
@@ -34,9 +35,29 @@ import frisco_fleet as ff  # the scenario's single source of truth
 HTTP_PORT = 8000
 STALE_S = 4.0   # no telemetry for longer than this -> mark the drone "stale"
 
+EVAL_S = 0.5              # how often the violation check runs
+DEPOT_SUPPRESS_M = 200.0  # within this range of a depot, ignore the low-alt rule
+STOP_SPEED = 0.6          # m/s at or below this counts as "hovering / stopped"
+DELIVERY_RADIUS_M = 120.0 # stopped within this of a delivery point = a drop
+
 # Live state: sysid -> dict of latest values. Guarded by `lock`.
 state = {}
 lock = threading.Lock()
+
+# Alerts (guarded by `lock`): current violations per drone, plus an edge-event feed.
+alerts_state = {}                  # sysid -> {code: message} currently active
+notifications = deque(maxlen=200)  # {t, sysid, company, kind, code, text}, newest first
+
+# Deliveries (guarded by `lock`).
+delivery_count = 0        # total completed deliveries since start
+delivered_ts = {}         # sysid -> epoch of that drone's most recent delivery
+
+# ArduCopter custom_mode number -> readable name (the common ones).
+COPTER_MODES = {
+    0: "STABILIZE", 1: "ACRO", 2: "ALT_HOLD", 3: "AUTO", 4: "GUIDED",
+    5: "LOITER", 6: "RTL", 7: "CIRCLE", 9: "LAND", 11: "DRIFT",
+    16: "POSHOLD", 17: "BRAKE", 20: "GUIDED_NOGPS", 21: "SMART_RTL",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +96,149 @@ def ingest(stop):
             with lock:
                 if sid in state:
                     state[sid]["speed_ms"] = round(msg.groundspeed, 1)
+        elif mtype == "HEARTBEAT":
+            # Flight mode lives in custom_mode (valid when the custom-mode flag is set).
+            if msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED:
+                mode = COPTER_MODES.get(msg.custom_mode, f"MODE{msg.custom_mode}")
+                with lock:
+                    state.setdefault(sid, {})["mode"] = mode
+        elif mtype == "SYS_STATUS":
+            # Battery remaining %, -1 when unknown.
+            with lock:
+                batt = msg.battery_remaining
+                state.setdefault(sid, {})["battery"] = batt if batt >= 0 else None
+
+
+# ---------------------------------------------------------------------------
+# GEOMETRY + RULES
+# ---------------------------------------------------------------------------
+EARTH_R = 6_371_000.0
+
+
+def haversine_m(lat1, lon1, lat2, lon2):
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * EARTH_R * math.asin(math.sqrt(a))
+
+
+def point_in_poly(lat, lon, poly):
+    """Ray casting; poly is [(lat, lon), ...]."""
+    inside = False
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        yi, xi = poly[i]
+        yj, xj = poly[j]
+        if ((yi > lat) != (yj > lat)) and \
+           (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def violations(d):
+    """Return {code: message} for every rule this drone currently breaks."""
+    out = {}
+    lat, lon, alt = d.get("lat"), d.get("lon"), d.get("alt_m")
+    if lat is None or alt is None:
+        return out
+    company = d.get("company")
+
+    # 1) above the 400 ft ceiling
+    if alt > ff.MAX_ALT_M:
+        out["HIGH"] = f"above 400 ft ({alt:.0f} m)"
+
+    # 2) below the 10 m floor — but only in transit (away from any depot)
+    if alt < ff.MIN_ALT_M:
+        near_depot = any(
+            haversine_m(lat, lon, dep[0], dep[1]) < DEPOT_SUPPRESS_M
+            for dep in ff.DEPOTS.values()
+        )
+        if not near_depot:
+            out["LOW"] = f"below 10 m ({alt:.0f} m)"
+
+    # 3) inside a no-fly zone
+    for z in ff.NO_FLY_ZONES:
+        if haversine_m(lat, lon, z["lat"], z["lon"]) < z["radius_m"]:
+            out[f"NOFLY:{z['name']}"] = f"in no-fly zone: {z['name']}"
+
+    # 4) outside its company's area of operations
+    poly = ff.AREAS_OF_OPERATION.get(company)
+    if poly and not point_in_poly(lat, lon, poly):
+        out["OUT_AO"] = f"left {company} area"
+
+    return out
+
+
+def _clear_label(code):
+    if code == "HIGH": return "back below ceiling"
+    if code == "LOW":  return "back above 10 m"
+    if code.startswith("NOFLY:"): return f"cleared no-fly: {code.split(':', 1)[1]}"
+    if code == "OUT_AO": return "back inside area"
+    return "cleared"
+
+
+def _emit(sid, code, text, kind):
+    company = ff.FLEET.get(sid, ("?", "?"))[0]
+    notifications.appendleft({"t": time.time(), "sysid": sid, "company": company,
+                              "kind": kind, "code": code, "text": text})
+
+
+# ---------------------------------------------------------------------------
+# EVALUATOR: edge-triggered — fire once on entry, once on clear
+# ---------------------------------------------------------------------------
+def evaluator(stop):
+    global delivery_count
+    prev = {}            # sysid -> {code: message} from the last pass
+    prev_delivered = set()  # sysids parked at a delivery point last pass
+    while not stop.is_set():
+        time.sleep(EVAL_S)
+        now = time.time()
+        with lock:
+            snap = {sid: dict(d) for sid, d in state.items()
+                    if "lat" in d and "last_seen" in d and (now - d["last_seen"]) < STALE_S}
+
+        cur = {sid: violations(d) for sid, d in snap.items()}
+
+        # Inferred deliveries: a drone stopped near a delivery point (not a depot).
+        cur_delivered = set()
+        for sid, dd in snap.items():
+            if dd.get("speed_ms", 99) > STOP_SPEED:
+                continue
+            lat, lon = dd["lat"], dd["lon"]
+            near_deliv = min((haversine_m(lat, lon, p[0], p[1])
+                              for p in ff.DELIVERY_POINTS), default=1e9) < DELIVERY_RADIUS_M
+            near_depot = any(haversine_m(lat, lon, dep[0], dep[1]) < DEPOT_SUPPRESS_M
+                             for dep in ff.DEPOTS.values())
+            if near_deliv and not near_depot:
+                cur_delivered.add(sid)
+
+        with lock:
+            for sid, v in cur.items():
+                old = prev.get(sid, {})
+                for code, msg in v.items():
+                    if code not in old:
+                        _emit(sid, code, msg, "enter")
+                for code in old:
+                    if code not in v:
+                        _emit(sid, code, _clear_label(code), "clear")
+            # drones that went stale/vanished: clear whatever they had
+            for sid, old in prev.items():
+                if sid not in cur:
+                    for code in old:
+                        _emit(sid, code, _clear_label(code), "clear")
+            alerts_state.clear()
+            alerts_state.update({sid: v for sid, v in cur.items() if v})
+
+            # newly-arrived deliveries -> count + timestamp (edge-triggered)
+            for sid in cur_delivered - prev_delivered:
+                delivery_count += 1
+                delivered_ts[sid] = now
+
+        prev = cur
+        prev_delivered = cur_delivered
 
 
 # ---------------------------------------------------------------------------
@@ -85,11 +249,20 @@ def snapshot():
     with lock:
         drones = []
         for d in state.values():
+            if "lat" not in d or "last_seen" not in d:
+                continue  # heard a heartbeat/battery but no position yet
             age = now - d["last_seen"]
             item = {k: v for k, v in d.items() if k != "last_seen"}
             item["status"] = "active" if age < STALE_S else "stale"
             item["age_s"] = round(age, 1)
+            item.setdefault("mode", None)
+            item.setdefault("battery", None)
+            a = alerts_state.get(d["sysid"], {})
+            item["alerts"] = list(a.values())
+            item["alert"] = bool(a)
+            item["delivered_ts"] = delivered_ts.get(d["sysid"])
             drones.append(item)
+        notif = [dict(n) for n in list(notifications)[:60]]
     drones.sort(key=lambda x: x["sysid"])
 
     depots = [
@@ -101,13 +274,28 @@ def snapshot():
     for d in drones:
         by_company[d["company"]] = by_company.get(d["company"], 0) + 1
 
+    areas = [
+        {"company": c, "color": ff.COMPANY_COLOR[c],
+         "polygon": [[la, lo] for la, lo in poly],
+         "label": [ff.AO_LABEL[c]["lat"], ff.AO_LABEL[c]["lon"]],
+         "label_dir": ff.AO_LABEL[c]["dir"]}
+        for c, poly in ff.AREAS_OF_OPERATION.items()
+    ]
+
     return {
         "updated": now,
         "center": {"lat": ff.MAP_CENTER[0], "lon": ff.MAP_CENTER[1]},
         "colors": ff.COMPANY_COLOR,
         "counts": {"total": len(drones), "active": active, "by_company": by_company},
         "depots": depots,
+        "areas": areas,
+        "nofly": ff.NO_FLY_ZONES,
         "drones": drones,
+        "notifications": [
+            {**n, "ago_s": round(now - n["t"], 1)} for n in notif
+        ],
+        "alerting": sum(1 for d in drones if d.get("alert")),
+        "deliveries": delivery_count,
     }
 
 
@@ -150,12 +338,15 @@ def reporter(stop):
         time.sleep(3.0)
         snap = snapshot()
         c = snap["counts"]
-        print(f"[utm] {c['active']}/{c['total']} active  {c['by_company']}")
+        alerting = snap["alerting"]
+        extra = f"  ALERTS: {alerting}" if alerting else ""
+        print(f"[utm] {c['active']}/{c['total']} active  {c['by_company']}{extra}")
 
 
 def main():
     stop = threading.Event()
     threading.Thread(target=ingest, args=(stop,), daemon=True).start()
+    threading.Thread(target=evaluator, args=(stop,), daemon=True).start()
     threading.Thread(target=reporter, args=(stop,), daemon=True).start()
 
     httpd = ThreadingHTTPServer(("127.0.0.1", HTTP_PORT), Handler)
