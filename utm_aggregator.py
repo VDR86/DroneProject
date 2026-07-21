@@ -40,6 +40,7 @@ DEPOT_SUPPRESS_M = 200.0  # within this range of a depot, ignore the low-alt rul
 STOP_SPEED = 0.6          # m/s at or below this counts as "hovering / stopped"
 DELIVERY_RADIUS_M = 120.0 # stopped within this of a delivery point = a drop
 
+MAX_TELEM_GAP = 3.0
 MAX_HORZ_SPD = 35.0  
 MAX_VERT_SPD = 8.0
 MAX_POS_JUMP_M = 250.0      
@@ -178,10 +179,15 @@ def violations(d):
 
  prev = last_samples.get(sid)
 
+
+    if prev:
+
+
+
     if prev:
         dt = now - prev["t"]
 
-        if dt > 0:
+        if dt > 0 and dt < MAX_TELEM_GAP:
             distance = haversine_m(
                 prev["lat"],
                 prev["lon"],
@@ -208,6 +214,10 @@ def violations(d):
                     out["IMPOSSIBLE_CLIMB"] = (
                         f"vertical rate {climb_rate:.1f} m/s"
                     )
+        else:
+            out["TELEM_GAP"] = (
+                f"telemetry gap {gap:.1f}s"
+            )
 
     last_samples[sid] = {
         "lat": lat,
