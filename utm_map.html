@@ -3,13 +3,21 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Frisco UTM — Drone Traffic Monitor</title>
+<title>Frisco UTM — Airspace Surveillance</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
   :root{
-    --bg:#0b0f14; --panel:#0f151d; --panel-2:#141c26;
-    --line:#1f2a36; --text:#e6edf3; --muted:#8b949e;
-    --live:#3fb950;
+    --bg:#070b10; --panel:#0b1118; --panel-2:#111b25;
+    --line:#1b2733; --text:#dfe8f0; --muted:#7d8b9a; --faint:#4a5866;
+    --instr:#3fd0c9;   /* instrument cyan — system nominal / live        */
+    --advisory:#f2b134;/* amber — flight-rule advisory (altitude/nofly)  */
+    --spoof:#ff2e7e;   /* hot magenta — security / spoofed telemetry     */
+    --ok:#46d17f;      /* delivered / cleared                            */
+    --disp:'Chakra Petch',system-ui,sans-serif;
+    --data:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
   }
   *{box-sizing:border-box}
   html,body{height:100%;margin:0}
@@ -18,48 +26,145 @@
     font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
     overflow:hidden;
   }
-  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .data{font-family:var(--data)}
 
-  #map{position:absolute; inset:0 0 0 320px; background:var(--bg)}
+  #map{position:absolute; inset:0 0 0 340px; background:var(--bg)}
 
-  /* ---- control-board side panel ---- */
+  /* ============ side console ============ */
   #panel{
-    position:absolute; top:0; left:0; bottom:0; width:320px;
-    background:var(--panel); border-right:1px solid var(--line);
+    position:absolute; top:0; left:0; bottom:0; width:340px;
+    background:linear-gradient(180deg,var(--panel),#080d13);
+    border-right:1px solid var(--line);
     display:flex; flex-direction:column; z-index:1000;
+    transition:box-shadow .5s ease, border-color .5s ease;
   }
-  .head{padding:16px 18px 14px; border-bottom:1px solid var(--line)}
-  .title{font-size:18px; font-weight:700; letter-spacing:.5px}
-  .sub{font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:2px; margin-top:2px}
-  .live{display:flex; align-items:center; gap:7px; margin-top:10px; font-size:12px; color:var(--muted)}
-  .dot{width:8px; height:8px; border-radius:50%; background:var(--live); box-shadow:0 0 8px var(--live)}
-  .dot.pulse{animation:pulse 1.6s infinite}
-  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  /* under attack the whole rail glows magenta */
+  body.cond-security #panel{
+    border-right-color:var(--spoof);
+    box-shadow:2px 0 26px -4px rgba(255,46,126,.55);
+  }
 
-  .totals{display:flex; gap:10px; padding:14px 18px; border-bottom:1px solid var(--line)}
-  .stat{flex:1; background:var(--panel-2); border:1px solid var(--line); border-radius:8px; padding:10px 12px}
-  .stat .n{font-size:22px; font-weight:700}
-  .stat .l{font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:1px}
+  .head{padding:18px 18px 15px; border-bottom:1px solid var(--line)}
+  .title{font-family:var(--disp); font-size:21px; font-weight:700; letter-spacing:2px}
+  .title .fx{color:var(--instr)}
+  .sub{font-size:10px; color:var(--muted); text-transform:uppercase;
+    letter-spacing:3px; margin-top:3px}
+  .live{display:flex; align-items:center; gap:7px; margin-top:12px;
+    font-size:11px; color:var(--muted); font-family:var(--data)}
+  .dot{width:8px; height:8px; border-radius:50%; background:var(--instr);
+    box-shadow:0 0 9px var(--instr)}
+  .dot.pulse{animation:pulse 1.7s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 
+  /* ---- CONDITION strip: the signature element ---- */
+  #condition{
+    position:relative; overflow:hidden;
+    padding:13px 18px; border-bottom:1px solid var(--line);
+    display:flex; align-items:baseline; gap:10px;
+    background:var(--panel-2);
+  }
+  #condition .lead{font-size:9px; letter-spacing:2px; color:var(--faint);
+    text-transform:uppercase; font-family:var(--data)}
+  #cond-word{font-family:var(--disp); font-weight:700; font-size:20px;
+    letter-spacing:2px; color:var(--instr)}
+  #cond-note{margin-left:auto; font-size:10px; color:var(--muted);
+    font-family:var(--data); text-align:right; max-width:150px}
+  body.cond-advisory #cond-word{color:var(--advisory)}
+  body.cond-security #cond-word{color:var(--spoof)}
+  /* scanning sweep only while under security condition */
+  #condition::after{content:""; position:absolute; inset:0; opacity:0;
+    background:linear-gradient(90deg,transparent,rgba(255,46,126,.16),transparent);
+    transform:translateX(-100%);}
+  body.cond-security #condition::after{opacity:1; animation:sweep 2.4s linear infinite}
+  @keyframes sweep{to{transform:translateX(100%)}}
+
+  /* ---- stat tiles ---- */
+  .totals{display:flex; gap:9px; padding:14px 18px; border-bottom:1px solid var(--line)}
+  .stat{flex:1; background:var(--panel-2); border:1px solid var(--line);
+    border-radius:9px; padding:10px 11px}
+  .stat .n{font-size:23px; font-weight:600; font-family:var(--data);
+    line-height:1; color:var(--instr)}
+  .stat .l{font-size:9px; color:var(--muted); text-transform:uppercase;
+    letter-spacing:1.5px; margin-top:6px}
+
+  /* ---- generic section frame ---- */
+  .sec{border-bottom:1px solid var(--line); padding:13px 18px}
+  .sec-head{font-size:10px; letter-spacing:2px; color:var(--muted);
+    text-transform:uppercase; font-family:var(--data);
+    display:flex; align-items:center; gap:8px; margin-bottom:9px}
+  .pill{min-width:20px; height:18px; border-radius:9px; padding:0 6px;
+    background:var(--panel-2); color:var(--muted);
+    font:600 11px var(--data); display:inline-flex; align-items:center; justify-content:center}
+  .pill.on{color:#fff}
+
+  /* ---- SECURITY section ---- */
+  #security{transition:background .4s ease, border-color .4s ease}
+  body.cond-security #security{
+    background:linear-gradient(180deg,rgba(255,46,126,.09),transparent 70%);
+    border-left:2px solid var(--spoof);
+  }
+  #security .sec-head{color:var(--spoof)}
+  #security .pill.on{background:var(--spoof)}
+  .sec-ok{font-size:11px; color:var(--muted); font-family:var(--data);
+    display:flex; align-items:center; gap:7px}
+  .sec-ok .tick{color:var(--ok)}
+  .chips{display:flex; flex-wrap:wrap; gap:5px; margin-bottom:9px}
+  .chip{font:600 10px var(--data); color:var(--spoof);
+    border:1px solid rgba(255,46,126,.4); background:rgba(255,46,126,.08);
+    border-radius:5px; padding:3px 7px; letter-spacing:.5px}
+  .chip .x{color:var(--muted); font-weight:400}
+  .threat{display:grid; grid-template-columns:auto 1fr; gap:9px;
+    align-items:start; padding:5px 0; border-top:1px solid rgba(255,46,126,.12)}
+  .threat:first-of-type{border-top:none}
+  .threat .who{font:600 12px var(--data); color:var(--spoof); white-space:nowrap}
+  .threat .what{font-size:11px; color:#ffb3cf; line-height:1.45}
+  .intru-log{margin-top:9px; border-top:1px dashed rgba(255,46,126,.2); padding-top:7px;
+    display:flex; flex-direction:column; gap:3px}
+  .intru{font:400 10px var(--data); color:#ff8fb5; white-space:nowrap;
+    overflow:hidden; text-overflow:ellipsis}
+  .intru .t{color:var(--faint)}
+
+  /* ---- flight ALERTS section ---- */
+  #alerts .sec-head{color:var(--advisory)}
+  #alerts .pill.on{background:var(--advisory); color:#1a1206}
+  .al-none{font-size:11px; color:var(--muted); font-family:var(--data); opacity:.7}
+  .al-row{display:grid; grid-template-columns:9px 34px 1fr; gap:8px;
+    align-items:center; padding:4px 0; font-size:12px}
+  .al-row .sd{width:8px; height:8px; border-radius:50%}
+  .al-row .id{color:var(--muted); font-family:var(--data)}
+  .al-row .msg{color:var(--advisory)}
+  .al-log{margin-top:9px; border-top:1px dashed var(--line); padding-top:7px;
+    display:flex; flex-direction:column; gap:3px}
+  .ev{font:400 10px var(--data); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .ev-enter{color:var(--advisory)}
+  .ev-clear{color:var(--ok)}
+  .ev .t{color:var(--faint)}
+
+  /* ---- fleet roster ---- */
   .fleets{flex:1; overflow-y:auto; padding:6px 0}
+  .fleets::-webkit-scrollbar{width:8px}
+  .fleets::-webkit-scrollbar-thumb{background:var(--line); border-radius:4px}
   .co{padding:12px 18px 6px; display:flex; align-items:center; gap:8px}
   .co .swatch{width:10px; height:10px; border-radius:2px}
   .co .name{font-weight:600; font-size:13px}
-  .co .ct{margin-left:auto; font-size:11px; color:var(--muted)}
-  .row{
-    display:grid; grid-template-columns:14px 34px 1fr auto; gap:8px; align-items:center;
-    padding:5px 18px; font-size:12px;
-  }
+  .co .ct{margin-left:auto; font-size:10px; color:var(--muted);
+    font-family:var(--data); text-transform:uppercase; letter-spacing:1px}
+  .row{display:grid; grid-template-columns:14px 40px 1fr auto; gap:8px;
+    align-items:center; padding:5px 18px; font-size:12px}
   .row .sd{width:8px; height:8px; border-radius:50%}
-  .row .id{color:var(--muted)}
-  .row .rd{color:var(--muted); font-size:11px; text-align:right}
-  .row.stale{opacity:.45}
+  .row.spoof .sd{background:var(--spoof)!important; box-shadow:0 0 7px var(--spoof)}
+  .row.spoof .id{color:var(--spoof)}
+  .row .id{color:var(--muted); font-family:var(--data)}
+  .row .val{font-family:var(--data)}
+  .row .rd{color:var(--muted); font-size:11px; text-align:right; font-family:var(--data)}
+  .row.stale{opacity:.4}
 
-  .legend{border-top:1px solid var(--line); padding:12px 18px; font-size:11px; color:var(--muted)}
+  .legend{border-top:1px solid var(--line); padding:11px 18px; font-size:10px;
+    color:var(--muted); font-family:var(--data)}
   .legend div{display:flex; align-items:center; gap:8px; margin:4px 0}
   .legend .k{width:14px; text-align:center}
 
-  /* ---- drone markers ---- */
+  /* ============ map markers ============ */
   .drone-icon{background:none; border:none}
   .drone{position:relative; width:30px; height:30px}
   .drone .arrow{
@@ -77,77 +182,83 @@
   }
   .drone .tag{
     position:absolute; left:19px; top:16px;
-    font:600 10px ui-monospace,monospace; color:var(--text);
+    font:600 10px var(--data); color:var(--text);
     text-shadow:0 0 3px #000,0 0 3px #000; white-space:nowrap;
   }
+  /* amber ping = flight-rule advisory */
   .drone.alert::after{
     content:""; position:absolute; left:50%; top:50%;
     width:30px; height:30px; margin:-15px 0 0 -15px; border-radius:50%;
-    border:2px solid #ff4d4d; animation:ping 1.2s ease-out infinite;
+    border:2px solid var(--advisory); animation:ping 1.3s ease-out infinite;
   }
   @keyframes ping{0%{transform:scale(.55);opacity:.9}100%{transform:scale(2.3);opacity:0}}
-  .deliv-badge{
-    font:700 11px system-ui; color:#3fdc7a; white-space:nowrap;
-    text-shadow:0 0 6px #000,0 0 6px #000;
-    animation:deliv 3s ease-out forwards;
+  /* magenta target-lock = spoofed telemetry (deliberately different) */
+  .drone.spoof .tag{color:var(--spoof)}
+  .drone.spoof .arrow{filter:drop-shadow(0 0 5px var(--spoof))}
+  .drone.spoof::before{
+    content:""; position:absolute; left:50%; top:50%;
+    width:32px; height:32px; margin:-16px 0 0 -16px; border-radius:50%;
+    border:1.5px dashed var(--spoof); animation:lock 3s linear infinite;
   }
+  .drone.spoof::after{
+    content:""; position:absolute; left:50%; top:50%;
+    width:22px; height:22px; margin:-11px 0 0 -11px; border-radius:50%;
+    border:2px solid var(--spoof); box-shadow:0 0 10px var(--spoof);
+    animation:hazard 1.1s ease-in-out infinite;
+  }
+  @keyframes lock{to{transform:rotate(360deg)}}
+  @keyframes hazard{0%,100%{opacity:.35;transform:scale(.9)}50%{opacity:1;transform:scale(1.15)}}
+
+  .deliv-badge{font:700 11px system-ui; color:var(--ok); white-space:nowrap;
+    text-shadow:0 0 6px #000,0 0 6px #000; animation:deliv 3s ease-out forwards}
   @keyframes deliv{
     0%{opacity:0; transform:translateY(5px) scale(.9)}
     15%{opacity:1; transform:translateY(0) scale(1)}
     70%{opacity:1; transform:translateY(-7px)}
     100%{opacity:0; transform:translateY(-18px)}
   }
-  .depot{
-    width:14px; height:14px; transform:rotate(45deg);
-    border:2px solid var(--c); background:rgba(0,0,0,.4);
-  }
-  .maplabel{font:600 11px system-ui; text-shadow:0 0 5px #000,0 0 5px #000;
+  .depot{width:14px; height:14px; transform:rotate(45deg);
+    border:2px solid var(--c); background:rgba(0,0,0,.4)}
+  .maplabel{font:600 11px var(--data); text-shadow:0 0 5px #000,0 0 5px #000;
     white-space:nowrap; box-sizing:border-box}
   .maplabel.ao{font-weight:700; letter-spacing:1px; opacity:.92}
   .maplabel.nfz{color:#ff8a8a; font-size:10px}
-  @media (prefers-reduced-motion: reduce){ .dot.pulse{animation:none} .drone.alert::after{animation:none} }
-
-  /* ---- alerts sidebar ---- */
-  .alerts{border-bottom:1px solid var(--line); padding:12px 18px}
-  .al-head{font-size:11px; letter-spacing:1px; color:var(--muted); text-transform:uppercase;
-    display:flex; align-items:center; gap:8px; margin-bottom:8px}
-  .al-count{min-width:20px; height:18px; border-radius:9px; background:var(--panel-2);
-    color:var(--muted); font:600 11px ui-monospace,monospace; display:inline-flex;
-    align-items:center; justify-content:center; padding:0 6px}
-  .al-count.on{background:#ff4d4d; color:#fff}
-  .al-none{font-size:12px; color:var(--muted); opacity:.6}
-  .al-row{display:grid; grid-template-columns:9px 34px 1fr; gap:8px; align-items:center;
-    padding:4px 0; font-size:12px}
-  .al-row .sd{width:8px; height:8px; border-radius:50%}
-  .al-row .id{color:var(--muted); font-family:ui-monospace,monospace}
-  .al-row .msg{color:#ff8a8a}
-  .al-log{margin-top:9px; border-top:1px dashed var(--line); padding-top:7px;
-    display:flex; flex-direction:column; gap:3px}
-  .ev{font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
-  .ev-enter{color:#ff8a8a}
-  .ev-clear{color:#6ecf8e}
-  .ev .t{color:var(--muted); opacity:.55}
+  @media (prefers-reduced-motion: reduce){
+    .dot.pulse,.drone.alert::after,.drone.spoof::before,.drone.spoof::after,
+    #condition::after{animation:none}
+  }
 </style>
 </head>
 <body>
   <div id="panel">
     <div class="head">
-      <div class="title">FRISCO UTM</div>
-      <div class="sub">UAS Traffic Management</div>
+      <div class="title">FRISCO<span class="fx">·</span>UTM</div>
+      <div class="sub">Airspace Surveillance</div>
       <div class="live"><span class="dot pulse"></span><span id="status">connecting…</span></div>
     </div>
+
+    <div id="condition">
+      <span class="lead">Condition</span>
+      <span id="cond-word">—</span>
+      <span id="cond-note"></span>
+    </div>
+
     <div class="totals">
       <div class="stat"><div class="n" id="t-active">0</div><div class="l">Active</div></div>
       <div class="stat"><div class="n" id="t-total">0</div><div class="l">Tracked</div></div>
       <div class="stat"><div class="n" id="t-deliv">0</div><div class="l">Delivered</div></div>
     </div>
-    <div class="alerts" id="alerts"></div>
+
+    <div class="sec" id="security"></div>
+    <div class="sec" id="alerts"></div>
+
     <div class="fleets" id="fleets"></div>
+
     <div class="legend">
       <div><span class="k">▲</span> drone (arrow = heading)</div>
       <div><span class="k">◯</span> ringed = real autopilot (SITL)</div>
+      <div><span class="k" style="color:var(--spoof)">◎</span> spoofed telemetry (target-locked)</div>
       <div><span class="k">◆</span> company depot</div>
-      <div><span class="k">⬡</span> area of operations (dotted)</div>
       <div><span class="k" style="color:#ff5a5a">⛔</span> no-fly zone</div>
     </div>
   </div>
@@ -155,6 +266,16 @@
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
+    // ---- security vocabulary (mirrors utm_guardian detector codes) ----
+    const SEC_LABEL = {
+      GHOST_ID:'Ghost aircraft', SRC_CONFLICT:'Duplicate source',
+      TELEPORT:'Position jump', CLIMB_RATE:'Impossible climb',
+      VEL_MISMATCH:'Speed mismatch', FLEET_GUIDED:'Fleet takeover',
+    };
+    const isSpoofStr = s => typeof s === 'string' && s.startsWith('SPOOF');
+    const isSecCode  = c => c in SEC_LABEL;
+    const cleanSpoof = s => s.replace(/^SPOOF\s*[—-]\s*/, '');
+
     const map = L.map('map', {zoomControl:true, attributionControl:true})
       .setView([33.150, -96.823], 12);
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
@@ -162,10 +283,8 @@
     }).addTo(map);
 
     const droneMarkers = {}, trails = {};
-    const shownDelivery = {};   // sysid -> last delivery ts we've already popped
-    let firstDeliveryScan = true;
-    let depotsDrawn = false;
-    let zonesDrawn = false;
+    const shownDelivery = {};
+    let firstDeliveryScan = true, depotsDrawn = false, zonesDrawn = false;
     const TRAIL_MAX = 80;
 
     function popDelivered(d){
@@ -176,11 +295,11 @@
     }
 
     function droneIcon(d){
-      const hdg = (d.hdg==null) ? 0 : d.hdg;
+      const hdg  = (d.hdg==null) ? 0 : d.hdg;
       const ring = d.kind === 'SITL' ? 'ring' : '';
-      const alert = d.alert ? 'alert' : '';
+      const spoof = d._spoof ? 'spoof' : (d.alert ? 'alert' : '');
       const html =
-        `<div class="drone ${d.status} ${ring} ${alert}" style="--c:${d.color}">
+        `<div class="drone ${d.status} ${ring} ${spoof}" style="--c:${d.color}">
            <div class="arrow" style="transform:rotate(${hdg}deg)"></div>
            <div class="tag">${d.sysid}</div>
          </div>`;
@@ -191,15 +310,16 @@
       const h = d.hdg==null ? '—' : d.hdg.toFixed(0)+'°';
       const mode = d.mode || '—';
       const batt = (d.battery==null) ? '—' : d.battery+'%';
+      const spoofMsgs  = (d.alerts||[]).filter(isSpoofStr).map(cleanSpoof);
+      const flightMsgs = (d.alerts||[]).filter(a=>!isSpoofStr(a));
       return `<b style="color:${d.color}">${d.company} · #${d.sysid}</b><br>`
-           + `<span class="mono">alt ${d.alt_m} m &nbsp; ${d.speed_ms} m/s &nbsp; ${h}</span><br>`
-           + `<span class="mono">${mode} &nbsp; batt ${batt}</span>`
-           + ((d.alerts && d.alerts.length) ? '<br><span style="color:#ff6b6b">⚠ '+d.alerts.join('<br>⚠ ')+'</span>' : '')
+           + `<span class="data">alt ${d.alt_m} m &nbsp; ${d.speed_ms} m/s &nbsp; ${h}</span><br>`
+           + `<span class="data">${mode} &nbsp; batt ${batt}</span>`
+           + (spoofMsgs.length ? '<br><span style="color:#ff2e7e">⊘ SPOOF: '+spoofMsgs.join('<br>⊘ ')+'</span>' : '')
+           + (flightMsgs.length ? '<br><span style="color:#f2b134">⚠ '+flightMsgs.join('<br>⚠ ')+'</span>' : '')
            + (d.status==='stale' ? '<br><i>signal lost</i>' : '');
     }
 
-    // Place a non-interactive text label beside a point.
-    // dir: 'right'/'left' (extends E/W), 'below'/'above', or 'center'. Fixed pixel size.
     function textLabel(latlng, text, extraCls, color, dir){
       const W = 150, H = 16, g = 12, v = 15;
       let anchor, align = 'center', pad = '';
@@ -207,7 +327,7 @@
       else if(dir === 'right'){ anchor = [0, H/2]; align = 'left'; pad = `padding-left:${g}px`; }
       else if(dir === 'below'){ anchor = [W/2, -v]; }
       else if(dir === 'above'){ anchor = [W/2, H + v]; }
-      else { anchor = [W/2, H/2]; }   // center
+      else { anchor = [W/2, H/2]; }
       const style = `width:${W}px; text-align:${align}; ${pad}; ${color ? 'color:'+color : ''}`;
       return L.marker(latlng, {interactive:false, icon:L.divIcon({className:'',
         iconSize:[W,H], iconAnchor:anchor,
@@ -219,7 +339,6 @@
         L.marker([p.lat,p.lon], {interactive:false, icon:L.divIcon({className:'',
           iconSize:[14,14], iconAnchor:[7,7],
           html:`<div class="depot" style="--c:${p.color}"></div>`})}).addTo(map);
-        // Label centered horizontally beneath the depot.
         textLabel([p.lat,p.lon], `${p.company} depot`, 'depot', p.color, 'below').addTo(map);
       });
     }
@@ -228,7 +347,6 @@
       (data.areas||[]).forEach(a=>{
         L.polygon(a.polygon, {color:a.color, weight:2, dashArray:'6 7',
           fill:false, interactive:false}).addTo(map);
-        // Label pinned to a fixed AO corner (Wing top-right, Zipline bottom-left).
         textLabel(a.label, `${a.company.toUpperCase()} AO`, 'ao', a.color, a.label_dir).addTo(map);
       });
       (data.nofly||[]).forEach(z=>{
@@ -243,16 +361,18 @@
       if(!depotsDrawn && data.depots){ drawDepots(data); depotsDrawn = true; }
       const seen = new Set();
       data.drones.forEach(d=>{
+        d._spoof = (d.alerts||[]).some(isSpoofStr);
         seen.add(d.sysid);
         const ll = [d.lat, d.lon];
 
         if(!trails[d.sysid]){
-          trails[d.sysid] = L.polyline([], {color:d.color, weight:2, opacity:.45});
-          trails[d.sysid].addTo(map); trails[d.sysid]._pts = [];
+          trails[d.sysid] = L.polyline([], {color:d.color, weight:2, opacity:.45}).addTo(map);
+          trails[d.sysid]._pts = [];
         }
         const tr = trails[d.sysid];
         tr._pts.push(ll); if(tr._pts.length>TRAIL_MAX) tr._pts.shift();
         tr.setLatLngs(tr._pts);
+        tr.setStyle({color: d._spoof ? '#ff2e7e' : d.color, opacity: d._spoof ? .7 : .45});
 
         if(!droneMarkers[d.sysid]){
           droneMarkers[d.sysid] = L.marker(ll,{icon:droneIcon(d)}).addTo(map)
@@ -261,7 +381,6 @@
         const m = droneMarkers[d.sysid];
         m.setLatLng(ll); m.setIcon(droneIcon(d)); m.setTooltipContent(tip(d));
       });
-      // drop markers/trails for drones that vanished entirely
       Object.keys(droneMarkers).forEach(sid=>{
         if(!seen.has(+sid)){
           map.removeLayer(droneMarkers[sid]); delete droneMarkers[sid];
@@ -269,7 +388,6 @@
         }
       });
 
-      // delivery pops: fire once per new delivery (skip whatever already happened on load)
       data.drones.forEach(d=>{
         if(!d.delivered_ts) return;
         if(firstDeliveryScan){ shownDelivery[d.sysid] = d.delivered_ts; return; }
@@ -281,10 +399,68 @@
       firstDeliveryScan = false;
     }
 
+    // ---- worst-state escalation drives the whole console ----
+    function updateCondition(data){
+      const sec = data.security || {flagged:0};
+      const spoofed = (sec.flagged||0) > 0 || data.drones.some(d=>d._spoof);
+      const advisory = (data.alerting||0) > 0;
+      const b = document.body;
+      b.classList.remove('cond-nominal','cond-advisory','cond-security');
+      const word = document.getElementById('cond-word');
+      const note = document.getElementById('cond-note');
+      if(spoofed){
+        b.classList.add('cond-security'); word.textContent = 'SECURITY';
+        note.textContent = 'spoofed telemetry detected';
+      } else if(advisory){
+        b.classList.add('cond-advisory'); word.textContent = 'ADVISORY';
+        note.textContent = 'flight-rule breach';
+      } else {
+        b.classList.add('cond-nominal'); word.textContent = 'NOMINAL';
+        note.textContent = 'all telemetry verified';
+      }
+    }
+
+    function updateSecurity(data){
+      const sec = data.security || {flagged_sysids:[], flagged:0, active_by_code:{}};
+      const flagged = data.drones.filter(d=>d._spoof);
+      const count = sec.flagged || flagged.length;
+      let html = `<div class="sec-head">Security`
+               + `<span class="pill ${count?'on':''}">${count}</span></div>`;
+
+      if(count === 0){
+        html += `<div class="sec-ok"><span class="tick">✓</span>No intrusions detected · telemetry verified</div>`;
+        document.getElementById('security').innerHTML = html;
+        return;
+      }
+
+      const byCode = sec.active_by_code || {};
+      const chips = Object.keys(byCode).map(c =>
+        `<span class="chip">${SEC_LABEL[c]||c} <span class="x">×${byCode[c]}</span></span>`).join('');
+      if(chips) html += `<div class="chips">${chips}</div>`;
+
+      flagged.forEach(d=>{
+        const msgs = (d.alerts||[]).filter(isSpoofStr).map(cleanSpoof).join('<br>');
+        html += `<div class="threat"><span class="who">#${d.sysid}</span>`
+              + `<span class="what">${msgs}</span></div>`;
+      });
+
+      const log = (data.notifications||[]).filter(n=>isSecCode(n.code)).slice(0,5);
+      if(log.length){
+        html += `<div class="intru-log">`;
+        log.forEach(n=>{
+          const verb = n.kind==='enter' ? '⊘' : '✓';
+          html += `<div class="intru">${verb} #${n.sysid} ${SEC_LABEL[n.code]||n.code} `
+                + `<span class="t">${Math.round(n.ago_s)}s</span></div>`;
+        });
+        html += `</div>`;
+      }
+      document.getElementById('security').innerHTML = html;
+    }
+
     function updatePanel(data){
       document.getElementById('t-active').textContent = data.counts.active;
       document.getElementById('t-total').textContent  = data.counts.total;
-      document.getElementById('t-deliv').textContent  = data.deliveries || 0;
+      document.getElementById('t-deliv').textContent   = data.deliveries || 0;
       const when = new Date(data.updated*1000).toLocaleTimeString();
       document.getElementById('status').textContent = 'live · updated '+when;
 
@@ -300,23 +476,27 @@
         list.forEach(d=>{
           const live = d.status==='active';
           const sd = live ? color : '#555';
-          html += `<div class="row ${live?'':'stale'}">`
+          const cls = (d._spoof?'spoof ':'') + (live?'':'stale');
+          html += `<div class="row ${cls}">`
                 + `<span class="sd" style="background:${sd}"></span>`
-                + `<span class="id mono">#${d.sysid}</span>`
-                + `<span class="mono">${d.alt_m} m</span>`
-                + `<span class="rd mono">${d.speed_ms} m/s</span></div>`;
+                + `<span class="id">#${d.sysid}</span>`
+                + `<span class="val">${d.alt_m} m</span>`
+                + `<span class="rd">${d.speed_ms} m/s</span></div>`;
         });
       });
       document.getElementById('fleets').innerHTML = html;
     }
 
     function updateAlerts(data){
+      // flight-rule alerts only — spoof alerts live in the SECURITY section
       const active = [];
-      data.drones.forEach(d => (d.alerts||[]).forEach(m => active.push({d, m})));
-      let html = `<div class="al-head">Alerts`
-               + `<span class="al-count ${active.length?'on':''}">${active.length}</span></div>`;
+      data.drones.forEach(d => (d.alerts||[])
+        .filter(m=>!isSpoofStr(m))
+        .forEach(m => active.push({d, m})));
+      let html = `<div class="sec-head">Flight alerts`
+               + `<span class="pill ${active.length?'on':''}">${active.length}</span></div>`;
       if(active.length === 0){
-        html += `<div class="al-none">no active alerts</div>`;
+        html += `<div class="al-none">no active advisories</div>`;
       } else {
         active.forEach(a=>{
           html += `<div class="al-row"><span class="sd" style="background:${a.d.color}"></span>`
@@ -324,7 +504,7 @@
                 + `<span class="msg">${a.m}</span></div>`;
         });
       }
-      const ev = (data.notifications||[]).slice(0,6);
+      const ev = (data.notifications||[]).filter(n=>!isSecCode(n.code)).slice(0,6);
       if(ev.length){
         html += `<div class="al-log">`;
         ev.forEach(n=>{
@@ -342,7 +522,11 @@
       try{
         const r = await fetch('/api/drones', {cache:'no-store'});
         const data = await r.json();
-        updateDrones(data); updatePanel(data); updateAlerts(data);
+        updateDrones(data);       // sets d._spoof, used by the rest
+        updateCondition(data);
+        updateSecurity(data);
+        updateAlerts(data);
+        updatePanel(data);
       }catch(e){
         document.getElementById('status').textContent = 'aggregator offline — retrying';
       }
