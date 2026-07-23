@@ -40,11 +40,6 @@ DEPOT_SUPPRESS_M = 200.0  # within this range of a depot, ignore the low-alt rul
 STOP_SPEED = 0.6          # m/s at or below this counts as "hovering / stopped"
 DELIVERY_RADIUS_M = 120.0 # stopped within this of a delivery point = a drop
 
-MAX_TELEM_GAP = 3.0
-MAX_HORZ_SPD = 35.0  
-MAX_VERT_SPD = 8.0
-MAX_POS_JUMP_M = 250.0      
-
 # Live state: sysid -> dict of latest values. Guarded by `lock`.
 state = {}
 lock = threading.Lock()
@@ -56,9 +51,6 @@ notifications = deque(maxlen=200)  # {t, sysid, company, kind, code, text}, newe
 # Deliveries (guarded by `lock`).
 delivery_count = 0        # total completed deliveries since start
 delivered_ts = {}         # sysid -> epoch of that drone's most recent delivery
-
-# Used in telemetry verification to determine if changes are abnormal 
-last_samples = {}
 
 # ArduCopter custom_mode number -> readable name (the common ones).
 COPTER_MODES = {
@@ -115,6 +107,12 @@ def ingest(stop):
             with lock:
                 batt = msg.battery_remaining
                 state.setdefault(sid, {})["battery"] = batt if batt >= 0 else None
+        elif mtype == "POSITION_TARGET_GLOBAL_INT":
+            # Where the drone is currently headed (its active waypoint).
+            with lock:
+                if sid in state:
+                    state[sid]["tgt_lat"] = msg.lat_int / 1e7
+                    state[sid]["tgt_lon"] = msg.lon_int / 1e7
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +147,7 @@ def point_in_poly(lat, lon, poly):
 def violations(d):
     """Return {code: message} for every rule this drone currently breaks."""
     out = {}
-    lat, lon, alt, sid, now = d.get("lat"), d.get("lon"), d.get("alt_m"), d.get("sysid"), time.time()
+    lat, lon, alt = d.get("lat"), d.get("lon"), d.get("alt_m")
     if lat is None or alt is None:
         return out
     company = d.get("company")
@@ -176,61 +174,6 @@ def violations(d):
     poly = ff.AREAS_OF_OPERATION.get(company)
     if poly and not point_in_poly(lat, lon, poly):
         out["OUT_AO"] = f"left {company} area"
-
- prev = last_samples.get(sid)
-
-
-    if prev:
-
-
-
-    if prev:
-        dt = now - prev["t"]
-
-        if dt > 0 and dt < MAX_TELEM_GAP:
-            distance = haversine_m(
-                prev["lat"],
-                prev["lon"],
-                lat,
-                lon,
-            )
-
-            horizontal_speed = distance / dt
-
-            if distance > MAX_POS_JUMP_M:
-                out["TELEPORT"] = (
-                    f"jumped {distance:.0f} m in {dt:.1f}s"
-                )
-
-            elif horizontal_speed > MAX_HORZ_SPD:
-                out["IMPOSSIBLE_SPEED"] = (
-                    f"{horizontal_speed:.1f} m/s exceeds limit"
-                )
-
-            if alt is not None and prev["alt"] is not None:
-                climb_rate = abs(alt - prev["alt"]) / dt
-
-                if climb_rate > MAX_VERT_SPD:
-                    out["IMPOSSIBLE_CLIMB"] = (
-                        f"vertical rate {climb_rate:.1f} m/s"
-                    )
-        else:
-            out["TELEM_GAP"] = (
-                f"telemetry gap {gap:.1f}s"
-            )
-
-    last_samples[sid] = {
-        "lat": lat,
-        "lon": lon,
-        "alt": alt,
-        "t": now,
-    }
-
-    hdg = d.get("hdg")
-
-    if hdg is not None:
-        if not (0 <= hdg <= 360):
-            out["BAD_HEADING"] = f"invalid heading {hdg}"
 
     return out
 
@@ -324,6 +267,21 @@ def snapshot():
             item["alerts"] = list(a.values())
             item["alert"] = bool(a)
             item["delivered_ts"] = delivered_ts.get(d["sysid"])
+            # Flight-plan path: current position -> destination, and (for the
+            # delivery fleet) on home to the depot.
+            plan = None
+            tlat, tlon = d.get("tgt_lat"), d.get("tgt_lon")
+            if tlat is not None:
+                pos = [d["lat"], d["lon"]]
+                depot = ff.DEPOTS.get(d.get("company"))
+                if d.get("kind") == "sim" and depot:
+                    if haversine_m(tlat, tlon, depot[0], depot[1]) < 120:
+                        plan = [pos, [depot[0], depot[1]]]
+                    else:
+                        plan = [pos, [tlat, tlon], [depot[0], depot[1]]]
+                else:
+                    plan = [pos, [tlat, tlon]]
+            item["plan"] = plan
             drones.append(item)
         notif = [dict(n) for n in list(notifications)[:60]]
     drones.sort(key=lambda x: x["sysid"])

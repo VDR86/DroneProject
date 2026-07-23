@@ -162,11 +162,22 @@
     }).addTo(map);
 
     const droneMarkers = {}, trails = {};
+    const latest = {};          // sysid -> most recent drone record (for hover)
+    let hoverSid = null, planLine = null;
     const shownDelivery = {};   // sysid -> last delivery ts we've already popped
     let firstDeliveryScan = true;
     let depotsDrawn = false;
     let zonesDrawn = false;
     const TRAIL_MAX = 80;
+
+    function showPlan(sid){
+      const d = latest[sid];
+      if(!d || !d.plan || d.plan.length < 2){ hidePlan(); return; }
+      if(planLine){ planLine.setLatLngs(d.plan); }
+      else { planLine = L.polyline(d.plan, {color:'#ffffff', weight:1.5,
+        dashArray:'3 6', opacity:.85, interactive:false}).addTo(map); }
+    }
+    function hidePlan(){ if(planLine){ map.removeLayer(planLine); planLine = null; } }
 
     function popDelivered(d){
       const m = L.marker([d.lat,d.lon], {interactive:false, zIndexOffset:1000,
@@ -193,7 +204,8 @@
       const batt = (d.battery==null) ? '—' : d.battery+'%';
       return `<b style="color:${d.color}">${d.company} · #${d.sysid}</b><br>`
            + `<span class="mono">alt ${d.alt_m} m &nbsp; ${d.speed_ms} m/s &nbsp; ${h}</span><br>`
-           + `<span class="mono">${mode} &nbsp; batt ${batt}</span>`
+           + `<span class="mono">${mode} &nbsp; batt ${batt}</span><br>`
+           + `<span class="mono">${d.lat.toFixed(5)}, ${d.lon.toFixed(5)}</span>`
            + ((d.alerts && d.alerts.length) ? '<br><span style="color:#ff6b6b">⚠ '+d.alerts.join('<br>⚠ ')+'</span>' : '')
            + (d.status==='stale' ? '<br><i>signal lost</i>' : '');
     }
@@ -244,6 +256,7 @@
       const seen = new Set();
       data.drones.forEach(d=>{
         seen.add(d.sysid);
+        latest[d.sysid] = d;
         const ll = [d.lat, d.lon];
 
         if(!trails[d.sysid]){
@@ -255,17 +268,25 @@
         tr.setLatLngs(tr._pts);
 
         if(!droneMarkers[d.sysid]){
-          droneMarkers[d.sysid] = L.marker(ll,{icon:droneIcon(d)}).addTo(map)
-            .bindTooltip(tip(d),{direction:'top',offset:[0,-14]});
+          const sid = d.sysid;
+          const mk = L.marker(ll,{icon:droneIcon(d)}).addTo(map)
+            .bindTooltip('',{direction:'top',offset:[0,-14]});
+          mk.on('mouseover', ()=>{ hoverSid = sid; showPlan(sid); });
+          mk.on('mouseout',  ()=>{ if(hoverSid===sid){ hoverSid = null; hidePlan(); } });
+          droneMarkers[d.sysid] = mk;
         }
         const m = droneMarkers[d.sysid];
         m.setLatLng(ll); m.setIcon(droneIcon(d)); m.setTooltipContent(tip(d));
       });
+      // keep the hovered drone's plan line following it as it moves
+      if(hoverSid !== null) showPlan(hoverSid);
       // drop markers/trails for drones that vanished entirely
       Object.keys(droneMarkers).forEach(sid=>{
         if(!seen.has(+sid)){
           map.removeLayer(droneMarkers[sid]); delete droneMarkers[sid];
           if(trails[sid]){ map.removeLayer(trails[sid]); delete trails[sid]; }
+          delete latest[sid];
+          if(hoverSid === +sid){ hoverSid = null; hidePlan(); }
         }
       });
 

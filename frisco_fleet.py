@@ -162,6 +162,7 @@ class SimDrone:
         self.hdg = self.rng.uniform(0, 360)
         self.phase = "to_delivery"
         self.target = self._pick_delivery()
+        self.dest = self.target          # where it's currently headed (for the flight plan)
         self.hover_until = 0.0
         self.vx = self.vy = self.vz = 0.0   # cm/s for telemetry
         self.battery = 100.0                # % — drains flying, tops up at depot
@@ -221,6 +222,10 @@ class SimDrone:
                 self.target = self._pick_delivery()
                 self.phase = "to_delivery"
 
+        # Current destination for the flight-plan line: the delivery when
+        # outbound, otherwise home to the depot.
+        self.dest = self.target if self.phase == "to_delivery" else self.depot
+
     def send(self, boot_ms, send_hb):
         if send_hb:
             self.conn.mav.heartbeat_send(
@@ -240,6 +245,15 @@ class SimDrone:
                 volt_mv, -1,        # battery voltage (mV), current (unknown)
                 int(self.battery),  # battery remaining %
                 0, 0, 0, 0, 0, 0)
+
+            # Current destination waypoint (drives the flight-plan line on the map).
+            if self.dest:
+                self.conn.mav.position_target_global_int_send(
+                    boot_ms,
+                    mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+                    0b0000110111111000,     # position only
+                    int(self.dest[0] * 1e7), int(self.dest[1] * 1e7), self.cruise,
+                    0, 0, 0, 0, 0, 0, 0, 0)
 
         self.conn.mav.global_position_int_send(
             boot_ms,
