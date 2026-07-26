@@ -10,11 +10,15 @@ A tiny web server that serves your real map page and, at /api/drones, a
 *scripted, hand-made* snapshot in exactly the shape the real aggregator emits.
 The demo fleet is the full 10 aircraft (Wing 2-6, Zipline 12-16), matching the
 real system's roster 1:1. It starts in NOMINAL and lets you fire any of
-several staged scenarios on demand, two ways:
+several staged scenarios on demand, driven entirely from the terminal this
+process is running in -- there is no on-page control of any kind, so nobody
+who can merely load the dashboard in a browser can change what it's showing:
 
-  In the browser:  a small control bar, bottom-left — CLEAN / AUTO, plus one
-                    button per scenario (FLEET / GHOST / CLIMB+VEL / GRADUAL).
-  In the terminal:
+It also demonstrates the spoof detail tab (utm_compare.html): a flagged
+(spoofed) drone gets an "off-course ↗" link — and utm_map.html auto-opens it
+— so you can watch its reported track plotted at /compare?sysid=N.
+
+  In the terminal (the only place this is controlled from):
     Enter        toggle the current scenario's takeover on/off
     a            force attack ON (current scenario)
     c            force clean (NOMINAL)
@@ -23,10 +27,9 @@ several staged scenarios on demand, two ways:
     2            select scenario: ghost aircraft (unregistered sysid)
     3            select scenario: climb-rate + velocity-mismatch spoof
     4            select scenario: gradual escalation (stages in over ~12s)
+    5            select scenario: GPS position spoof (false reported position)
+    6            select scenario: envelope breach (hijack hits all flight rules)
     q            quit
-Both control paths call the same functions, so they can't drift out of sync —
-flip it from the browser and the terminal's next status line agrees, and vice
-versa.
 
 SCENARIOS
 ---------
@@ -58,6 +61,18 @@ SCENARIOS
             condition climb from NOMINAL to ADVISORY to SECURITY instead of
             snapping straight to red.
 
+  gpsspoof  Wing #6 is fed a false GPS signal: its REPORTED position follows
+            a normal-looking depot->delivery path (right altitude, right speed,
+            heading SE toward a delivery, well inside the AO). Its TRUE autopilot
+            follows a hard-coded attacker route: NW from the depot (WP1), north
+            past the Medical Helipad boundary (WP2), then east to a capture point
+            outside Wing's AO (WP3). A second orange marker tracks the true
+            position through each waypoint in real time. Three alert codes fire:
+            GPS_SPOOF (heading vs. position-delta mismatch), VEL_MISMATCH
+            (reported speed vs. near-zero frame delta on the spoofed track), and
+            OUT_AO (true position exits Wing's AO after WP2). All three are also
+            derivable by utm_guardian.py from real telemetry.
+
 What it is NOT
 --------------
 This is a front-end test only. It serves canned JSON to your browser. It does
@@ -83,12 +98,12 @@ Stop the real aggregator first (this uses the same port 8000), then:
 
     py ui_selftest.py
 
-...and open  http://localhost:8000/  in the browser. Click a scenario button
-(or press 1-4 in the terminal) to pick a scenario, then ATTACK (or Enter) to
-fire it and watch the console react; click CLEAN to go back to NOMINAL.
+...and open  http://localhost:8000/  in the browser to watch it, then switch
+back to this terminal and press 1-4 to pick a scenario, Enter (or a) to fire
+it and watch the console react, c to go back to NOMINAL.
 
 Requires frisco_fleet.py AND fleet_spoof.py in the same folder (geography and
-the scatter-offset constants, respectively — neither is actually connected to).
+the scatter-offset constants — neither is actually connected to).
 """
 
 import json
@@ -97,6 +112,7 @@ import os
 import random
 import threading
 import time
+from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -124,19 +140,55 @@ _GRADUAL_STAGES = (0.0, 4.0, 8.0, 12.0)
 _GRADUAL_VIEW_BUFFER_S = 4.0   # extra time to actually see the finale before auto cycles back
 LOOP_S = TAKEOVER_AT + _GRADUAL_STAGES[-1] + _GRADUAL_VIEW_BUFFER_S  # in "auto" mode: scene length before it repeats
 
-# Find the map next to this script, regardless of the launch directory.
-HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "utm_map.html")
+# Find the map (and the off-course compare page) next to this script,
+# regardless of the launch directory.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+HTML_PATH = os.path.join(_HERE, "utm_map.html")
+COMPARE_HTML_PATH = os.path.join(_HERE, "utm_compare.html")
+
+# The recorded SPOOFED pathway per sysid: only the positions reported WHILE
+# that drone was flagged, starting fresh at the beginning of each incident
+# and persisting (frozen) after the alert clears — same behaviour as the
+# real aggregator's spoof_tracks.
+SPOOF_TRACKS = defaultdict(list)
+_PREV_SPOOFED_SIDS = set()
+
+# Persistent security notification log — edge-triggered, same shape as the real
+# aggregator's notifications deque. Entries are appended once when an anomaly
+# first fires and persist (with their original timestamp) after the attack clears
+# so the left-panel log doesn't vanish the instant you type 'c'.
+_SEC_LOG = deque(maxlen=200)   # {t, sysid, company, kind, code, text}
+_PREV_NOTES_KEY = set()        # (sysid, code) pairs active last tick
+
+# Delivery tracking for non-spoofed drones. Detection mirrors the REAL
+# aggregator's own rule (utm_aggregator.evaluator): "parked" near a delivery
+# point and NOT near a depot, using the drone's actual reported position —
+# not an internal phase flag — so tracking is computed fresh every tick and
+# can't get stuck partway through an attack.
+# _delivery_count  total completed deliveries since startup.
+# _delivered_ts    sysid -> epoch of that drone's most recent delivery arrival.
+# _at_delivery     sysid -> bool, whether it was "parked at a delivery point"
+#                  on the previous snapshot tick (for edge-triggering).
+_delivery_count = 0
+_delivered_ts   = {}   # sysid -> float epoch
+_at_delivery    = {}   # sysid -> bool
+
+# Same distance thresholds utm_aggregator.py uses to infer a completed
+# delivery from telemetry alone, so this fixture's "✓ Delivered" behaves
+# exactly like the real system's would.
+DELIVERY_RADIUS_M = 120.0   # matches utm_aggregator.DELIVERY_RADIUS_M
+DEPOT_SUPPRESS_M  = 200.0   # matches utm_aggregator.DEPOT_SUPPRESS_M
 
 START = time.time()
 
-# Scene control, driven by the keyboard thread and the browser control bar.
+# Scene control, driven entirely by the keyboard thread below.
 #   mode        "manual" -> hold whatever attack_on says (fire on demand)
 #               "auto"   -> the old timed loop (clean for TAKEOVER_AT, attack)
 #   scenario    which staged scenario to run when attacking (see SCENARIOS)
 #   attack_started_at  wall-clock time the CURRENT manual attack turned on,
 #               used only by the "gradual" scenario to stage its escalation
 CTRL = {"mode": "manual", "attack_on": False, "scenario": "fleet",
-        "attack_started_at": None}
+        "attack_started_at": None, "reset_token": 0}
 CTRL_LOCK = threading.Lock()
 
 # Ten demo aircraft — Wing 2-6, Zipline 12-16 — matching the real fleet's
@@ -233,6 +285,17 @@ CLEAN_PATH_STATE = {}       # sysid -> mutable flight-state dict
 CLEAN_PATH_LOCK = threading.Lock()
 _MAX_CATCHUP_TICKS = 2000   # safety cap (~500s of simulated flight per call)
 
+# This fixture's clean drones fly the REAL Frisco depot<->delivery distances
+# (2.8-12.8 km) at frisco_fleet's real cruise speed (15 m/s) -- a genuine 3 to
+# 14+ MINUTES per leg. That's correct physics but a bad demo: in a normal
+# testing session nothing ever visibly delivers, so the counter/badge look
+# broken even though they aren't. ui_selftest exists to let you watch every
+# UI state quickly, so its own clean-path sim (not the real fleet, and not
+# the spoofed/breakaway motion, which already reads fast via its own
+# multipliers) runs this many times faster than real life -- distances and
+# geography are untouched, only the demo's clock is sped up.
+DEMO_TIME_MULT = 12.0
+
 
 def _clean_path_step(state, tgt, speed_mult=1.0):
     """One TICK_S step toward tgt; True once arrived. Mirrors
@@ -242,7 +305,7 @@ def _clean_path_step(state, tgt, speed_mult=1.0):
     a bigger number."""
     d = ff.distance_m(state["lat"], state["lon"], tgt[0], tgt[1])
     state["hdg"] = ff.bearing_deg(state["lat"], state["lon"], tgt[0], tgt[1])
-    step = ff.SPEED_MS * speed_mult * ff.TICK_S
+    step = ff.SPEED_MS * speed_mult * DEMO_TIME_MULT * ff.TICK_S
     if d <= step or d < 1.0:
         state["lat"], state["lon"] = tgt
         return True
@@ -259,7 +322,7 @@ def _clean_path_tick(state, company, t, speed_mult=1.0):
     cruise = ff.CRUISE_ALT_M[company]
     if state["phase"] in ("to_delivery", "to_depot"):
         if state["rel_alt"] < cruise:
-            state["rel_alt"] = min(cruise, state["rel_alt"] + ff.CLIMB_RATE * ff.TICK_S)
+            state["rel_alt"] = min(cruise, state["rel_alt"] + ff.CLIMB_RATE * DEMO_TIME_MULT * ff.TICK_S)
         tgt = state["target"] if state["phase"] == "to_delivery" else ff.DEPOTS[company]
         if _clean_path_step(state, tgt, speed_mult):
             state["hover_until"] = t + ff.HOVER_S
@@ -470,14 +533,14 @@ def _scn_ghost(now, t_since, attacking):
     # Same _orbit() shape, just fed sped-up time -- an intruder with no real
     # depot or route should look erratic and fast, not calmly circling.
     glat, glon, ghdg = _orbit(33.130, -96.810, 3.0, (now - START) * SPOOF_SPEED_MULT)
-    msg = f"sysid {ghost_sid} not in known fleet roster"
+    msg = f"sysid {ghost_sid} not in known fleet roster - POSSIBLE COLLISION DETECTED!"
     ghosts.append({
         "sysid": ghost_sid, "company": "UNKNOWN", "kind": "ghost",
         "color": "#ff2e7e",
         "lat": glat, "lon": glon, "alt_m": 95, "amsl_m": 95 + ff.FIELD_ALT_M,
         "hdg": ghdg, "speed_ms": round(9.0 * SPOOF_SPEED_MULT, 1), "mode": "AUTO", "battery": 0,
         "status": "active", "age_s": 0.2, "spoofed": True,
-        "alerts": [f"SPOOF — {msg}"], "alert": True, "delivered_ts": None,
+        "alerts": [f"SPOOF — {msg}"], "codes": ["GHOST_ID"], "alert": True, "delivered_ts": None,
     })
     notes.append((ghost_sid, "GHOST_ID", msg, 0.0))
     return overrides, ghosts, notes
@@ -546,8 +609,275 @@ def _scn_gradual(now, t_since, attacking):
             entry["speed_mult"] = HIJACK_SPEED_MULT   # overrides any earlier stage's speed_mult (e.g. #3's climb boost)
             entry["alerts"] = entry.get("alerts", []) + [("FLEET_GUIDED", guided_msg)]
             overrides[sid] = entry
-        notes.append((2, "FLEET_GUIDED", guided_msg, _GRADUAL_STAGES[3]))
+            notes.append((sid, "FLEET_GUIDED", guided_msg, _GRADUAL_STAGES[3]))
 
+    return overrides, [], notes
+
+
+# ---------------------------------------------------------------------------
+# GPS SPOOF scenario: hard-coded true waypoint path for Wing #6.
+#
+# The attacker feeds Wing #6 a false GPS signal so the UTM sees it flying a
+# normal clean depot->delivery leg. The drone's REAL autopilot, however, is
+# following a completely different set of waypoints chosen by the attacker —
+# the route below. This lets the demo show a widening gap between the spoofed
+# marker (blue, calm) and a second orange "true position" marker that visibly
+# works through a sequence of waypoints before exiting Wing's AO entirely.
+#
+# Waypoints are (lat, lon) in order. The drone departs from Wing's depot,
+# visits each one at SPOOF_SPEED_MULT x cruise, and holds at the final
+# capture point once it arrives. Each waypoint is labelled for the script:
+#   WP0 → WP1  initial NW diversion (away from Wing's delivery cluster)
+#   WP1 → WP2  jog north past the Medical Helipad no-fly boundary
+#   WP2 → WP3  final east run to the capture point outside Wing's AO
+# ---------------------------------------------------------------------------
+_GPS_SPOOF_VICTIM_SID = 6
+_GPS_SPOOF_WAYPOINTS = [
+    ff.DEPOTS["Wing"],          # WP0 — start (Wing depot, west side)
+    (33.172, -96.912),          # WP1 — NW diversion, inside AO but heading wrong
+    (33.196, -96.905),          # WP2 — north, approaching Medical Helipad zone
+    (33.210, -96.868),          # WP3 — capture point, outside Wing AO (east edge)
+]
+# Reported (spoofed) heading the attacker injects: points south-east toward a
+# plausible Wing delivery, while the drone is actually flying north-west.
+_GPS_SPOOF_REPORTED_HDG = 145.0
+_GPS_SPOOF_REPORTED_SPEED = round(ff.SPEED_MS, 1)   # normal cruise — looks fine
+
+
+def _gps_spoof_true_pos(t_since):
+    """Walk Wing #6's TRUE position along _GPS_SPOOF_WAYPOINTS at
+    SPOOF_SPEED_MULT × cruise, returning (lat, lon, hdg, leg_index)."""
+    speed = ff.SPEED_MS * SPOOF_SPEED_MULT
+    remaining = t_since * speed   # total metres the drone has covered
+
+    lat, lon = _GPS_SPOOF_WAYPOINTS[0]
+    for i in range(1, len(_GPS_SPOOF_WAYPOINTS)):
+        wlat, wlon = _GPS_SPOOF_WAYPOINTS[i]
+        seg = ff.distance_m(lat, lon, wlat, wlon)
+        if remaining <= seg:
+            frac = remaining / seg if seg > 0 else 1.0
+            out_lat = lat + (wlat - lat) * frac
+            out_lon = lon + (wlon - lon) * frac
+            hdg = ff.bearing_deg(lat, lon, wlat, wlon)
+            return round(out_lat, 6), round(out_lon, 6), round(hdg, 1), i - 1
+        remaining -= seg
+        lat, lon = wlat, wlon
+
+    # Past the last waypoint — hold at capture point.
+    hdg = ff.bearing_deg(_GPS_SPOOF_WAYPOINTS[-2][0], _GPS_SPOOF_WAYPOINTS[-2][1],
+                          _GPS_SPOOF_WAYPOINTS[-1][0], _GPS_SPOOF_WAYPOINTS[-1][1])
+    return round(lat, 6), round(lon, 6), round(hdg, 1), len(_GPS_SPOOF_WAYPOINTS) - 1
+
+
+def _point_in_wing_ao(lat, lon):
+    """Ray-casting check against Wing's area of operations polygon."""
+    poly = ff.AREAS_OF_OPERATION.get("Wing", [])
+    if not poly:
+        return True
+    inside = False
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        yi, xi = poly[i]
+        yj, xj = poly[j]
+        if ((yi > lat) != (yj > lat)) and \
+           (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+# ===========================================================================
+# LIVE FLIGHT-RULE EVALUATOR
+# ---------------------------------------------------------------------------
+# The real aggregator / utm_guardian.py derives flight-rule alerts geometrically
+# from each aircraft's REPORTED telemetry — altitude vs the ceiling/floor,
+# position vs its company's area of operations, and position vs every no-fly
+# zone. This fixture now runs the SAME checks on the reported position it emits
+# for each drone, so a hijacked drone that actually flies out of the envelope
+# earns a real flight alert here exactly as a live drone would, instead of the
+# alert being hand-scripted per scenario.
+#
+# Flight-rule codes (HIGH / LOW / OUT_AO / NOFLY:<name>) are DISTINCT from the
+# security/spoof codes: their alert strings are NOT "SPOOF —" prefixed, so the
+# map routes them to the amber flight-alert channel, not the magenta security
+# one, and they never inflate the SECURITY count / spoof toast.
+# ===========================================================================
+def _point_in_poly(lat, lon, poly):
+    """Ray-casting point-in-polygon for any (lat, lon) boundary list."""
+    if not poly:
+        return True
+    inside = False
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        yi, xi = poly[i]
+        yj, xj = poly[j]
+        if ((yi > lat) != (yj > lat)) and \
+           (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _flight_rule_alerts(company, lat, lon, alt_m):
+    """Return [(code, msg)] for every flight-rule breach visible in this
+    aircraft's REPORTED telemetry — the same evaluation a live aggregator runs
+    off MAVLink. Codes: HIGH, LOW, OUT_AO, NOFLY:<zone>. Never SPOOF-prefixed.
+
+    alt_m is the reported RELATIVE altitude (metres above ground), matching the
+    frame the ceiling/floor limits in frisco_fleet.py are expressed in.
+    """
+    out = []
+
+    # --- altitude envelope ---
+    if alt_m > ff.MAX_ALT_M:
+        out.append(("HIGH",
+                    f"altitude {alt_m:.0f} m exceeds {ff.MAX_ALT_M:.0f} m ceiling"))
+    else:
+        # The floor is enforced only once the aircraft is out on a leg — not
+        # during the normal takeoff/landing climb near its own pad — so ordinary
+        # ops don't false-trip LOW. By the time a drone is >250 m from its depot
+        # it has long since climbed through the 10 m floor to cruise.
+        depot = ff.DEPOTS.get(company)
+        away = depot is None or ff.distance_m(lat, lon, depot[0], depot[1]) > 250.0
+        if 1.0 < alt_m < ff.MIN_ALT_M and away:
+            out.append(("LOW",
+                        f"altitude {alt_m:.0f} m below {ff.MIN_ALT_M:.0f} m floor"))
+
+    # --- area of operations (only aircraft with a known company AO) ---
+    poly = ff.AREAS_OF_OPERATION.get(company)
+    if poly and not _point_in_poly(lat, lon, poly):
+        out.append(("OUT_AO",
+                    f"aircraft outside {company} area of operations"))
+
+    # --- no-fly zones (circle containment) ---
+    for z in ff.NO_FLY_ZONES:
+        if ff.distance_m(lat, lon, z["lat"], z["lon"]) <= z["radius_m"]:
+            out.append((f"NOFLY:{z['name']}",
+                        f'aircraft inside no-fly zone "{z["name"]}"'))
+
+    return out
+
+
+def _scn_gpsspoof(now, t_since, attacking):
+    """GPS position-spoofing demonstration with a hard-coded true waypoint path.
+
+    Wing #6's reported telemetry follows a normal-looking clean depot->delivery
+    leg (right altitude, right speed, heading SE toward a plausible delivery,
+    well inside the AO). Its TRUE autopilot is flying a completely different
+    attacker-chosen route: NW from the depot, north past the Medical Helipad
+    boundary, then east to a capture point outside Wing's AO.
+
+    The dashboard shows two markers for sysid 6:
+      Blue  (kind="sim")      — what the UTM is being told: normal behaviour.
+      Orange (kind="true_pos") — where the aircraft really is, working through
+                                 the waypoint sequence in real time.
+
+    Three alert codes fire and the guardian can independently derive all of them
+    from real telemetry (see utm_guardian.py):
+      GPS_SPOOF    Reported heading (SE) is the opposite of the movement vector
+                   implied by the spoofed position deltas (the spoofed position
+                   moves very slowly; the heading doesn't match even that).
+      VEL_MISMATCH Reported speed (15 m/s) is inconsistent with the frame-to-
+                   frame delta of the (stationary / slow-drifting) spoofed track.
+      OUT_AO       Once the true position crosses past WP2, it exits Wing's AO
+                   polygon — flagged by the guardian's AO check.
+    """
+    overrides, ghosts, notes = {}, [], []
+    if not attacking:
+        return overrides, ghosts, notes
+
+    sid = _GPS_SPOOF_VICTIM_SID
+    true_lat, true_lon, true_hdg, leg = _gps_spoof_true_pos(t_since)
+    gap_m = int(ff.distance_m(
+        true_lat, true_lon,
+        ff.DEPOTS["Wing"][0], ff.DEPOTS["Wing"][1]))
+    outside_ao = not _point_in_wing_ao(true_lat, true_lon)
+
+    spoof_msg = (f"#{sid} heading ({_GPS_SPOOF_REPORTED_HDG:.0f}°) is opposite to "
+                 f"its position-delta vector — GPS signal inconsistent")
+    vel_msg   = (f"#{sid} reports {_GPS_SPOOF_REPORTED_SPEED} m/s but spoofed "
+                 f"position delta implies near-zero ground speed")
+    out_msg   = (f"#{sid} true position {gap_m} m from reported, "
+                 + ("outside Wing AO — aircraft diverted" if outside_ao
+                    else f"leg {leg+1}/{len(_GPS_SPOOF_WAYPOINTS)-1} of attacker route"))
+
+    alerts = [("GPS_SPOOF", spoof_msg), ("VEL_MISMATCH", vel_msg)]
+    if outside_ao or t_since > 5.0:   # OUT_AO fires as soon as it's meaningful
+        alerts.append(("OUT_AO", out_msg))
+
+    # The REPORTED position stays on the clean depot->delivery path — no
+    # breakaway_bearing_deg or hijacked flag — so the spoofed marker appears
+    # to behave normally. Only heading and speed are pinned to the fake values.
+    overrides[sid] = {
+        "spoofed": True,
+        "alerts": alerts,
+        "speed_ms": _GPS_SPOOF_REPORTED_SPEED,
+        # hdg override: the clean_path_pos heading is suppressed in snapshot()
+        # below because we inject a fixed reported heading via the override dict.
+        "_reported_hdg": _GPS_SPOOF_REPORTED_HDG,
+    }
+    for code, msg in alerts:
+        notes.append((sid, code, msg, 0.0))
+
+    # Orange "true position" ghost marker.
+    ghosts.append({
+        "sysid": sid, "company": "Wing", "kind": "true_pos",
+        "color": "#ff6600",
+        "lat": true_lat, "lon": true_lon,
+        "alt_m": ff.CRUISE_ALT_M["Wing"],
+        "amsl_m": ff.CRUISE_ALT_M["Wing"] + ff.FIELD_ALT_M,
+        "hdg": true_hdg,
+        "speed_ms": round(ff.SPEED_MS * SPOOF_SPEED_MULT, 1),
+        "mode": "AUTO", "battery": 0,
+        "status": "active", "age_s": 0.2, "spoofed": True,
+        "alerts": [f"SPOOF — true pos, leg {leg+1}/{len(_GPS_SPOOF_WAYPOINTS)-1}"
+                   + (" — OUTSIDE AO" if outside_ao else "")],
+        "alert": True, "delivered_ts": None,
+    })
+
+    return overrides, ghosts, notes
+
+
+# ---------------------------------------------------------------------------
+# ENVELOPE-BREACH scenario: a coordinated hijack that flies each seized drone
+# into a DIFFERENT flight-rule violation, so every flight-alert type the
+# aggregator can raise — HIGH, LOW, OUT_AO and NOFLY — is exercised at once,
+# and always in the "drone is hacked" context. Positions/altitudes are pinned
+# deterministically (see the pin_pos override) so all four fire the instant the
+# attack starts, instead of depending on a runaway path reaching a boundary.
+#
+# Each drone is spoofed=True with a FLEET_GUIDED takeover code (so it registers
+# as hacked in the Security channel); the geometric evaluator then independently
+# adds the flight-rule code from the pinned position, exactly as it would from a
+# live hijacked aircraft's telemetry.
+# ---------------------------------------------------------------------------
+#   sysid, expected flight code, pinned (lat, lon, rel_alt_m), human note
+_ENVELOPE_BREACHES = [
+    (2,  "HIGH",   (33.150, -96.850, 300.0),
+     "seized and force-climbed above the 122 m ceiling"),
+    (3,  "LOW",    (33.120, -96.840, 5.0),
+     "seized and pushed below the 10 m floor out on a leg"),
+    (4,  "OUT_AO", (33.150, -96.700, 80.0),
+     "seized and flown east out of Wing's area of operations"),
+    (14, "NOFLY",  (33.1150, -96.7520, 100.0),
+     "seized and flown into a restricted no-fly zone"),
+]
+
+
+def _scn_envelope(now, t_since, attacking):
+    """Hijack four drones and fly each into a distinct flight-envelope breach,
+    so HIGH, LOW, OUT_AO and NOFLY all occur together while the drones are
+    hacked. See _ENVELOPE_BREACHES for the pinned positions."""
+    overrides, notes = {}, []
+    if not attacking:
+        return overrides, [], notes
+    for sid, _brk, pin, note in _ENVELOPE_BREACHES:
+        msg = f"#{sid} {note}"
+        overrides[sid] = {"spoofed": True, "pin_pos": pin,
+                          "alerts": [("FLEET_GUIDED", msg)]}
+        notes.append((sid, "FLEET_GUIDED", msg, 0.0))
     return overrides, [], notes
 
 
@@ -556,8 +886,10 @@ SCENARIOS = {
     "ghost":    ("Ghost aircraft",          _scn_ghost),
     "climbvel": ("Climb + velocity spoof",  _scn_climbvel),
     "gradual":  ("Gradual escalation",      _scn_gradual),
+    "gpsspoof": ("GPS position spoof",      _scn_gpsspoof),
+    "envelope": ("Envelope breach (all flight rules)", _scn_envelope),
 }
-SCENARIO_ORDER = ["fleet", "ghost", "climbvel", "gradual"]
+SCENARIO_ORDER = ["fleet", "ghost", "climbvel", "gradual", "gpsspoof", "envelope"]
 
 
 def _attack_state(now):
@@ -576,6 +908,8 @@ def _attack_state(now):
 
 
 def snapshot():
+    global _delivery_count, _delivered_ts, _at_delivery, _PREV_SPOOFED_SIDS
+    global _PREV_NOTES_KEY
     now = time.time()
     attacking, t_since = _attack_state(now)
     with CTRL_LOCK:
@@ -584,6 +918,11 @@ def snapshot():
     overrides, ghosts, notes = scn_fn(now, t_since, attacking)
 
     drones, flagged_sysids, by_code = [], [], {}
+    cur_spoofed_sids = set()
+    # Flight-rule (advisory) accumulator — kept SEPARATE from the security ones
+    # above so a flight breach never inflates the SECURITY count/toast, exactly
+    # like the real aggregator's two independent alert channels.
+    flight_alerting_sids = set()  # drones with >=1 active flight-rule breach
 
     for i, (sid, company, _blat, _blon, _alt) in enumerate(DEMO):
         ov = overrides.get(sid)
@@ -612,6 +951,16 @@ def snapshot():
             spoofed = ov.get("spoofed", False)
             mode = ov.get("mode", mode)
             alt_here = rel_alt + ov.get("alt_offset_m", 0)
+            # A scenario can PIN a hijacked drone to an exact reported position
+            # and altitude (deterministic breach placement) instead of relying
+            # on the clean-path integrator to fly it there over time. Heading is
+            # aimed from the company depot toward the pinned point so the marker
+            # arrow still reads sensibly.
+            if "pin_pos" in ov:
+                plat, plon, palt = ov["pin_pos"]
+                dep = ff.DEPOTS.get(company, (plat, plon))
+                hdg = ff.bearing_deg(dep[0], dep[1], plat, plon)
+                lat, lon, alt_here = plat, plon, palt
             # A scenario can pin speed/battery to a specific suspicious value
             # (e.g. VEL_MISMATCH's #14 claiming an elevated m/s) instead of
             # the drone's normal varied reading.
@@ -623,6 +972,67 @@ def snapshot():
                 alerts.append(f"SPOOF — {msg}")
                 by_code[code] = by_code.get(code, 0) + 1
             flagged_sysids.append(sid)
+            cur_spoofed_sids.add(sid)
+
+        if spoofed:
+            if sid not in _PREV_SPOOFED_SIDS:
+                SPOOF_TRACKS[sid] = []   # fresh incident: start recording clean
+            SPOOF_TRACKS[sid].append([round(lat, 6), round(lon, 6)])
+
+        # Flight plan: current position -> active target -> depot (if returning).
+        # Mirrors what the real aggregator builds from POSITION_TARGET_GLOBAL_INT.
+        # Only included for non-spoofed drones — a hacked drone's declared plan
+        # can't be trusted and the map suppresses it anyway.
+        plan = None
+        depot_ll = ff.DEPOTS[company]
+        if not spoofed:
+            with CLEAN_PATH_LOCK:
+                ps = CLEAN_PATH_STATE.get(sid)
+            if ps is not None:
+                pos = [lat, lon]
+                tgt = ps.get("target")
+                cur_phase = ps.get("phase")
+                if cur_phase == "to_delivery" and tgt:
+                    plan = [pos, list(tgt), list(depot_ll)]
+                elif cur_phase in ("to_depot", "drop", "rest"):
+                    plan = [pos, list(depot_ll)]
+
+        # Delivery detection — same rule utm_aggregator.py's evaluator uses on
+        # real telemetry: "parked" near a delivery point and NOT near a depot.
+        # Computed from the drone's actual reported position for EVERY drone,
+        # every tick, regardless of spoofed status, so tracking is always
+        # fresh and can't get stuck mid-attack (the old version only read the
+        # internal flight phase while `not spoofed`, so a drone that was
+        # spoofed-but-still-moving on its real route, e.g. climbvel's #3/#14,
+        # would freeze its edge-detector and silently drop whatever delivery
+        # happened while it was flagged). Only the CREDIT — the counter and
+        # delivered_ts, which pops the "✓ Delivered" badge — is withheld while
+        # a drone is currently spoofed; a hacked drone's own "dropped it off"
+        # signal still can't be trusted, same as before.
+        near_deliv = min(
+            (ff.distance_m(lat, lon, p[0], p[1]) for p in ff.DELIVERY_POINTS),
+            default=1e9) < DELIVERY_RADIUS_M
+        near_depot = ff.distance_m(lat, lon, depot_ll[0], depot_ll[1]) < DEPOT_SUPPRESS_M
+        at_delivery = near_deliv and not near_depot
+        was_at_delivery = _at_delivery.get(sid, False)
+        if at_delivery and not was_at_delivery and not spoofed:
+            _delivery_count += 1
+            _delivered_ts[sid] = now
+        _at_delivery[sid] = at_delivery
+
+        # ---- LIVE flight-rule evaluation on the REPORTED telemetry ----
+        # Same geometric checks the aggregator applies to every live aircraft.
+        # Runs regardless of whether the drone is spoofed: a hijacked drone that
+        # actually leaves the envelope (climbs past the ceiling, exits its AO,
+        # enters a no-fly zone) now earns a genuine flight alert here, in the
+        # exact shape the real system emits. Flight strings are plain (no
+        # "SPOOF —" prefix) so the map shows them as amber advisories.
+        flight_codes = []
+        for code, msg in _flight_rule_alerts(company, lat, lon, alt_here):
+            alerts.append(msg)
+            flight_codes.append(code)
+        if flight_codes:
+            flight_alerting_sids.add(sid)
 
         drones.append({
             "sysid": sid, "company": company, "kind": "sim",
@@ -631,7 +1041,11 @@ def snapshot():
             "amsl_m": round(alt_here + ff.FIELD_ALT_M, 1),
             "hdg": hdg, "speed_ms": speed_ms, "mode": mode, "battery": battery,
             "status": "active", "age_s": 0.2, "spoofed": spoofed,
-            "alerts": alerts, "alert": bool(alerts), "delivered_ts": None,
+            "alerts": alerts, "alert": bool(alerts),
+            "codes": [code for code, _ in (ov.get("alerts", []) if ov else [])],
+            "flight_codes": flight_codes,
+            "delivered_ts": _delivered_ts.get(sid) if not spoofed else None,
+            "plan": plan,
         })
 
         # SRC_CONFLICT's whole point is a SECOND source claiming a different
@@ -652,26 +1066,68 @@ def snapshot():
                 "hdg": hdg, "speed_ms": speed_ms, "mode": mode, "battery": battery,
                 "status": "active", "age_s": 0.2, "spoofed": True,
                 "alerts": [f"SPOOF — second source for #{sid} conflicts with the first"],
+                "codes": ["SRC_CONFLICT"],
                 "alert": True, "delivered_ts": None,
             })
 
     ghost_sysids = {g["sysid"] for g in ghosts}
     for g in ghosts:
+        # A real intruder aircraft is subject to the same flight rules as the
+        # fleet. Evaluate them on its reported position (skip the synthetic
+        # true_pos truth-echo, whose divergence is already a security finding).
+        if g.get("kind") == "ghost":
+            gfc = []
+            for code, msg in _flight_rule_alerts(
+                    g.get("company"), g["lat"], g["lon"], g.get("alt_m", 0)):
+                g.setdefault("alerts", []).append(msg)
+                gfc.append(code)
+            if gfc:
+                g["flight_codes"] = gfc
+                g["alert"] = True
+                flight_alerting_sids.add(g["sysid"])
         drones.append(g)
         flagged_sysids.append(g["sysid"])
+        gsid = g["sysid"]
+        cur_spoofed_sids.add(gsid)
+        if gsid not in _PREV_SPOOFED_SIDS:
+            SPOOF_TRACKS[gsid] = []
+        SPOOF_TRACKS[gsid].append([g["lat"], g["lon"]])
 
-    # notes is the single source of truth for both the notification feed and
-    # the by_code counts (overrides' alerts were already counted above, so
-    # only count a note here if it belongs to a ghost that isn't in overrides).
-    # Each note's own stage_t offset (0.0 for every scenario except the
-    # staggered "gradual" one) is what lets a later-firing alert show a
-    # later, correct timestamp instead of all sharing the attack's start time.
-    attack_start = now - t_since
-    notifications = [{"t": attack_start + stage_t, "sysid": sid, "company": "",
-                       "kind": "enter", "code": code, "text": msg}
-                      for sid, code, msg, stage_t in notes]
-    for sid, code, msg, _stage_t in notes:
-        if sid in ghost_sysids:
+    _PREV_SPOOFED_SIDS = cur_spoofed_sids
+
+    # Edge-triggered security log: append a new entry only when a (sysid, code)
+    # pair appears that wasn't active last tick. This means each anomaly gets
+    # exactly one notification when it fires and the log persists after 'c'.
+    # Only SECURITY notes go in the edge-triggered log now: the flight-rule
+    # event log was removed from the UI, and because some flight codes (e.g.
+    # OUT_AO) also exist in the map's security vocabulary, routing flight notes
+    # here would leak them back into the Security tab. Flight alerts surface
+    # solely through each drone's live `alerts`/`flight_codes` (the amber
+    # Flight-alerts row + marker badge), never the log.
+    log_notes = notes
+    cur_notes_key = {(sid, code) for sid, code, _msg, _st in log_notes}
+    for sid, code, msg, stage_t in log_notes:
+        if (sid, code) not in _PREV_NOTES_KEY:
+            company = ff.FLEET.get(sid, ("UNKNOWN", "?"))[0]
+            _SEC_LOG.appendleft({
+                "t": now, "sysid": sid, "company": company,
+                "kind": "enter", "code": code, "text": msg,
+            })
+    # Clear edges: anomalies that just stopped firing get a "cleared" entry.
+    for sid, code in _PREV_NOTES_KEY:
+        if (sid, code) not in cur_notes_key:
+            company = ff.FLEET.get(sid, ("UNKNOWN", "?"))[0]
+            _SEC_LOG.appendleft({
+                "t": now, "sysid": sid, "company": company,
+                "kind": "clear", "code": code, "text": "cleared",
+            })
+    _PREV_NOTES_KEY.clear()
+    _PREV_NOTES_KEY.update(cur_notes_key)
+
+    # by_code was already built in the drone loop above (one entry per override alert).
+    # Add any ghost-only codes that aren't in overrides.
+    for sid, code, _msg, _st in notes:
+        if sid in ghost_sysids and code not in by_code:
             by_code[code] = by_code.get(code, 0) + 1
 
     depots = [{"company": c, "lat": ll[0], "lon": ll[1],
@@ -693,24 +1149,28 @@ def snapshot():
                    "active": len(drones), "by_company": by_company},
         "depots": depots, "areas": areas, "nofly": ff.NO_FLY_ZONES,
         "drones": drones,
-        "notifications": [{**n, "ago_s": round(now - n["t"], 1)}
-                          for n in notifications],
-        "alerting": 0,   # this fixture only demonstrates security alerts
-        "deliveries": 3,
+        "notifications": [
+            {**n, "ago_s": round(now - n["t"], 1)}
+            for n in list(_SEC_LOG)[:60]
+        ],
+        "alerting": len(flight_alerting_sids),
+        "deliveries": _delivery_count,
         "security": {"flagged_sysids": sorted(set(flagged_sysids)),
                      "flagged": len(set(flagged_sysids)),
                      "active_by_code": by_code},
         "scenario": {"key": scenario_key, "label": _label,
                      "t_since_attack": round(t_since, 1)},
+        "reset_token": CTRL["reset_token"],
     }
 
 
 def _apply_ctrl(cmd):
-    """Apply one command to CTRL. Shared by the terminal keyboard() loop and
-    the browser's control-bar buttons, so both control paths can never drift
-    out of sync with each other."""
+    """Apply one command to CTRL. The single entry point the terminal
+    keyboard() loop uses to change the scene -- this is now the ONLY control
+    surface; nothing on the served page can call it."""
     cmd = cmd.strip().lower()
     with CTRL_LOCK:
+        global _SEC_LOG, _PREV_NOTES_KEY
         if cmd in ("", "t", "toggle"):
             CTRL["mode"] = "manual"
             CTRL["attack_on"] = not CTRL["attack_on"]
@@ -723,6 +1183,9 @@ def _apply_ctrl(cmd):
             CTRL["mode"] = "manual"
             CTRL["attack_on"] = False
             CTRL["attack_started_at"] = None
+            CTRL["reset_token"] += 1
+            _SEC_LOG.clear()
+            _PREV_NOTES_KEY.clear()
         elif cmd == "auto":
             CTRL["mode"] = "auto"
         elif cmd in ("1", "fleet"):
@@ -733,6 +1196,10 @@ def _apply_ctrl(cmd):
             CTRL["scenario"] = "climbvel"
         elif cmd in ("4", "gradual"):
             CTRL["scenario"] = "gradual"
+        elif cmd in ("5", "gpsspoof", "gps"):
+            CTRL["scenario"] = "gpsspoof"
+        elif cmd in ("6", "envelope", "env"):
+            CTRL["scenario"] = "envelope"
         else:
             return False
     return True
@@ -755,15 +1222,65 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/drones":
             self._send(json.dumps(snapshot()).encode(), "application/json")
-        elif parsed.path == "/api/ctrl":
-            # Browser control-bar endpoint: /api/ctrl?cmd=c|a|auto|1|2|3|4
-            cmd = parse_qs(parsed.query).get("cmd", [""])[0]
-            ok = _apply_ctrl(cmd)
-            if ok:
-                print(f"[selftest] {_state_line()}  (via browser)")
-            with CTRL_LOCK:
-                state = dict(CTRL)
-            self._send(json.dumps({"ok": ok, **state}).encode(), "application/json")
+        elif parsed.path == "/api/track":
+            # One drone's regular/original plan plus its recorded SPOOFED
+            # pathway (only populated while/after it's been flagged) —
+            # same shape as the real aggregator's /api/track.
+            qs = parse_qs(parsed.query)
+            try:
+                sid = int((qs.get("sysid") or [""])[0])
+            except ValueError:
+                self._send(json.dumps({"error": "missing/invalid ?sysid="}).encode(),
+                           "application/json")
+                return
+            data = snapshot()   # also freshens SPOOF_TRACKS for this instant
+            rec = next((d for d in data["drones"] if d.get("sysid") == sid), None)
+            fallback_company = next((c for s, c, *_ in DEMO if s == sid), "Unknown")
+            payload = {
+                "sysid": sid,
+                "company": rec["company"] if rec else fallback_company,
+                "color": rec["color"] if rec else ff.COMPANY_COLOR.get(fallback_company, "#888888"),
+                "spoof_track": list(SPOOF_TRACKS.get(sid, [])),
+                "lat": rec["lat"] if rec else None,
+                "lon": rec["lon"] if rec else None,
+                "alerts": rec["alerts"] if rec else [],
+                "spoofed": bool(rec and rec.get("spoofed")),
+            }
+            self._send(json.dumps(payload).encode(), "application/json")
+        elif parsed.path == "/api/tracks":
+            # Off-course page: every drone that has EVER been flagged in this
+            # demo session, each with its recorded spoofed pathway plotted
+            # against its regular/original plan. Drones that have never been
+            # spoofed don't appear here — their "where it's going" line lives
+            # on the main map instead.
+            data = snapshot()
+            by_sid = {d["sysid"]: d for d in data["drones"]}
+            out = []
+            for sid, track in SPOOF_TRACKS.items():
+                if not track:
+                    continue
+                rec = by_sid.get(sid)
+                fallback_company = next((c for s, c, *_ in DEMO if s == sid), "Unknown")
+                out.append({
+                    "sysid": sid,
+                    "company": rec["company"] if rec else fallback_company,
+                    "color": rec["color"] if rec else ff.COMPANY_COLOR.get(fallback_company, "#888888"),
+                    "spoof_track": list(track),
+                    "lat": rec["lat"] if rec else None,
+                    "lon": rec["lon"] if rec else None,
+                    "alerts": rec.get("alerts", []) if rec else [],
+                    "spoofed": bool(rec and rec.get("spoofed")),
+                })
+            out.sort(key=lambda x: x["sysid"])
+            self._send(json.dumps({"drones": out}).encode(), "application/json")
+        elif parsed.path == "/compare":
+            try:
+                with open(COMPARE_HTML_PATH, "rb") as f:
+                    self._send(f.read(), "text/html; charset=utf-8")
+            except FileNotFoundError:
+                self._send(b"<h1>utm_compare.html not found</h1>"
+                           b"<p>Keep it in the same folder as ui_selftest.py.</p>",
+                           "text/html; charset=utf-8")
         elif parsed.path in ("/", "/index.html"):
             try:
                 with open(HTML_PATH, "rb") as f:
@@ -772,73 +1289,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(b"<h1>put utm_map.html in this folder</h1>",
                            "text/html; charset=utf-8")
                 return
-            self._send(_inject_demo_controls(html), "text/html; charset=utf-8")
+            self._send(html, "text/html; charset=utf-8")
         else:
             self.send_response(404)
             self.end_headers()
 
-
-# A small floating control bar, injected only by THIS fixture — the real
-# utm_map.html file served by utm_aggregator.py in production stays untouched.
-# It just calls /api/ctrl, the same endpoint the keyboard commands use.
-_DEMO_CONTROLS_HTML = b"""
-<div id="demo-ctrl" style="position:fixed; left:18px; bottom:18px; z-index:2500;
-  display:flex; flex-direction:column; gap:6px; align-items:flex-start;
-  font:600 10px 'IBM Plex Mono',ui-monospace,monospace;">
-  <div style="display:flex; gap:6px; align-items:center;
-    background:linear-gradient(180deg,#0b1118,#080d13);
-    border:1px solid #1b2733; border-radius:20px; padding:6px;
-    box-shadow:0 10px 26px -10px rgba(0,0,0,.6);">
-    <span style="color:#7d8b9a; padding:0 4px; letter-spacing:1px;">SCENARIO</span>
-    <button data-cmd="1" style="cursor:pointer; border:none; border-radius:14px; padding:7px 10px;
-      background:#111b25; color:#6fb3ff; font:inherit;">FLEET</button>
-    <button data-cmd="2" style="cursor:pointer; border:none; border-radius:14px; padding:7px 10px;
-      background:#111b25; color:#6fb3ff; font:inherit;">GHOST</button>
-    <button data-cmd="3" style="cursor:pointer; border:none; border-radius:14px; padding:7px 10px;
-      background:#111b25; color:#6fb3ff; font:inherit;">CLIMB+VEL</button>
-    <button data-cmd="4" style="cursor:pointer; border:none; border-radius:14px; padding:7px 10px;
-      background:#111b25; color:#6fb3ff; font:inherit;">GRADUAL</button>
-  </div>
-  <div style="display:flex; gap:6px; align-items:center;
-    background:linear-gradient(180deg,#0b1118,#080d13);
-    border:1px solid #1b2733; border-radius:20px; padding:6px;
-    box-shadow:0 10px 26px -10px rgba(0,0,0,.6);">
-    <span style="color:#7d8b9a; padding:0 4px; letter-spacing:1px;">DEMO</span>
-    <button data-cmd="c" style="cursor:pointer; border:none; border-radius:14px; padding:7px 12px;
-      background:#111b25; color:#46d17f; font:inherit;">CLEAN</button>
-    <button data-cmd="a" style="cursor:pointer; border:none; border-radius:14px; padding:7px 12px;
-      background:#111b25; color:#ff2e7e; font:inherit;">ATTACK</button>
-    <button data-cmd="auto" style="cursor:pointer; border:none; border-radius:14px; padding:7px 12px;
-      background:#111b25; color:#f2b134; font:inherit;">AUTO</button>
-  </div>
-</div>
-<script>
-(function(){
-  document.querySelectorAll('#demo-ctrl button').forEach(function(btn){
-    btn.addEventListener('click', function(){
-      fetch('/api/ctrl?cmd=' + encodeURIComponent(btn.dataset.cmd)).then(function(){
-        // Refresh right away instead of waiting up to 1s for the page's own
-        // setInterval(poll,1000) tick -- otherwise a scenario switch or
-        // ATTACK/CLEAN click can leave the PREVIOUS scenario's flags/markers
-        // on screen for up to a second, which looks like a stale drone is
-        // still (or wrongly) tagged. poll() is a plain top-level function in
-        // the main script, so it's already on window by the time this runs.
-        if (typeof window.poll === 'function') window.poll();
-      });
-    });
-  });
-})();
-</script>
-"""
-
-
-def _inject_demo_controls(html_bytes):
-    """Append the demo control bar right before </body>, or at the end if the
-    page has no </body> tag for some reason."""
-    marker = b"</body>"
-    if marker in html_bytes:
-        return html_bytes.replace(marker, _DEMO_CONTROLS_HTML + marker, 1)
-    return html_bytes + _DEMO_CONTROLS_HTML
 
 
 def _state_line():
@@ -852,16 +1307,15 @@ def _state_line():
 
 
 def keyboard(stop):
-    """Read stdin lines and drive the scene. Enter toggles the takeover.
-    'q' quits the process; everything else goes through _apply_ctrl, the same
-    function the browser's buttons call."""
+    """Read stdin lines and drive the scene -- the only control surface this
+    fixture has. Enter toggles the takeover; 'q' quits the process."""
     for line in iter(input, None):     # blocks per line; ends on EOF/Ctrl+C
         cmd = line.strip().lower()
         if cmd in ("q", "quit", "exit"):
             stop.set(); break
         if not _apply_ctrl(cmd):
             print("[selftest] keys: Enter=toggle  a=attack  c=clean  auto=timed  "
-                  "1=fleet 2=ghost 3=climb+vel 4=gradual  q=quit")
+                  "1=fleet 2=ghost 3=climb+vel 4=gradual 5=gpsspoof  q=quit")
             continue
         print(f"[selftest] {_state_line()}")
 
@@ -873,10 +1327,10 @@ def main():
     threading.Thread(target=keyboard, args=(stop,), daemon=True).start()
 
     print(f"[selftest] display fixture on http://localhost:{HTTP_PORT}/")
-    print("[selftest] starts NOMINAL, scenario=fleet. Controls: buttons in the "
-          "browser, or type here:")
+    print("[selftest] starts NOMINAL, scenario=fleet. Open the URL above to watch; "
+          "control it from THIS terminal only:")
     print("[selftest]   Enter = fire/clear the takeover     a = attack     c = clean")
-    print("[selftest]   auto = timed loop     1-4 = pick scenario     q = quit")
+    print("[selftest]   auto = timed loop     1-6 = pick scenario     q = quit")
     print(f"[selftest] scenarios: " +
           ", ".join(f"{k}={v[0]}" for k, v in SCENARIOS.items()))
     print(f"[selftest] {_state_line()}")

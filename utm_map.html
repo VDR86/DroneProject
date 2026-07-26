@@ -44,6 +44,17 @@
     box-shadow:2px 0 26px -4px rgba(255,46,126,.55);
   }
 
+  /* pinned top: title + condition + stat tiles — never scroll away */
+  #panel-top{ flex-shrink:0 }
+
+  /* everything below the pinned header scrolls as one column */
+  #panel-body{
+    flex:1; overflow-y:auto; padding-bottom:24px;
+    scrollbar-width:thin; scrollbar-color:var(--line) transparent;
+  }
+  #panel-body::-webkit-scrollbar{width:8px}
+  #panel-body::-webkit-scrollbar-thumb{background:var(--line); border-radius:4px}
+
   .head{padding:18px 18px 15px; border-bottom:1px solid var(--line)}
   .title{font-family:var(--disp); font-size:21px; font-weight:700; letter-spacing:2px}
   .title .fx{color:var(--instr)}
@@ -119,10 +130,13 @@
   .threat .who{font:600 12px var(--data); color:var(--spoof); white-space:nowrap}
   .threat .what{font-size:11px; color:#ffb3cf; line-height:1.45}
   .intru-log{margin-top:9px; border-top:1px dashed rgba(255,46,126,.2); padding-top:7px;
-    display:flex; flex-direction:column; gap:3px}
-  .intru{font:400 10px var(--data); color:#ff8fb5; white-space:nowrap;
-    overflow:hidden; text-overflow:ellipsis}
-  .intru .t{color:var(--faint)}
+    display:flex; flex-direction:column; gap:5px}
+  .intru{font:400 10px var(--data); line-height:1.5}
+  .intru-who{font-weight:600; white-space:nowrap}
+  .intru-body{color:inherit; opacity:.85}
+  .intru-enter{color:#ff8fb5}
+  .intru-clear{color:var(--ok)}
+  .intru .t{color:var(--faint); white-space:nowrap}
 
   /* ---- flight ALERTS section ---- */
   #alerts .sec-head{color:var(--advisory)}
@@ -141,22 +155,20 @@
   .ev .t{color:var(--faint)}
 
   /* ---- fleet roster ---- */
-  .fleets{flex:1; overflow-y:auto; padding:6px 0}
-  .fleets::-webkit-scrollbar{width:8px}
-  .fleets::-webkit-scrollbar-thumb{background:var(--line); border-radius:4px}
+  .fleets{padding:6px 0}
   .co{padding:12px 18px 6px; display:flex; align-items:center; gap:8px}
   .co .swatch{width:10px; height:10px; border-radius:2px}
   .co .name{font-weight:600; font-size:13px}
   .co .ct{margin-left:auto; font-size:10px; color:var(--muted);
     font-family:var(--data); text-transform:uppercase; letter-spacing:1px}
   .row{display:grid; grid-template-columns:14px 40px 1fr auto; gap:8px;
-    align-items:center; padding:5px 18px; font-size:12px}
-  .row .sd{width:8px; height:8px; border-radius:50%}
+    align-items:start; padding:5px 18px; font-size:12px}
+  .row .sd{width:8px; height:8px; border-radius:50%; margin-top:3px}
   .row.spoof .sd{background:var(--spoof)!important; box-shadow:0 0 7px var(--spoof)}
   .row.spoof .id{color:var(--spoof)}
-  .row .id{color:var(--muted); font-family:var(--data)}
-  .row .val{font-family:var(--data)}
-  .row .rd{color:var(--muted); font-size:11px; text-align:right; font-family:var(--data)}
+  .row .id{color:var(--muted); font-family:var(--data); padding-top:1px}
+  .row .val{font-family:var(--data); line-height:1.6}
+  .row .rd{color:var(--muted); font-size:11px; text-align:right; font-family:var(--data); padding-top:1px}
   .row.stale{opacity:.4}
 
   .legend{border-top:1px solid var(--line); padding:11px 18px; font-size:10px;
@@ -164,7 +176,21 @@
   .legend div{display:flex; align-items:center; gap:8px; margin:4px 0}
   .legend .k{width:14px; text-align:center}
 
-  /* ============ SECURITY TOAST — small corner alert, swipe/tap to dismiss ============
+  .compare-link{font-size:10px; color:var(--instr); text-decoration:none;
+    border-bottom:1px dotted var(--instr); white-space:nowrap}
+  .compare-link:hover{opacity:.75}
+
+  /* dark tooltip to match the UI theme */
+  .leaflet-tooltip{
+    background:var(--panel); border:1px solid var(--line);
+    border-radius:6px; color:var(--text);
+    font-family:var(--data); font-size:11px; line-height:1.6;
+    padding:7px 10px; box-shadow:0 4px 16px rgba(0,0,0,.6);
+    pointer-events:none;
+  }
+  .leaflet-tooltip::before{ border-top-color:var(--line) !important; }
+
+/* ============ SECURITY TOAST — small corner alert, swipe/tap to dismiss ============
      Replaces the old full-screen "HACKED" takeover. This never covers the map or
      the sidebar — it just sits in the bottom-right corner. Deliberately styled
      like the rest of the console (same panel gradient, same border/radius as
@@ -215,10 +241,7 @@
     padding-top:8px; margin-top:2px; border-top:1px dashed rgba(255,255,255,.07); }
   @media (prefers-reduced-motion: reduce){ #sec-toast.show{ animation:none } }
 
-  /* ---- reopen chip: brings a dismissed alert back ----
-     Dismissing the toast (✕ or swipe) doesn't clear the alert, just hides the
-     card. While the underlying threat is still active, this small pill stays
-     in the same corner so nothing is lost — tap it to bring the toast back. */
+/* ============ SECURITY TOAST — small corner alert, swipe/tap to dismiss ============ */
   #sec-reopen{
     position:fixed; right:18px; bottom:18px; z-index:1999;
     display:none; align-items:center; gap:7px; cursor:pointer;
@@ -255,14 +278,12 @@
     font:600 10px var(--data); color:var(--text);
     text-shadow:0 0 3px #000,0 0 3px #000; white-space:nowrap;
   }
-  /* amber ping = flight-rule advisory */
   .drone.alert::after{
     content:""; position:absolute; left:50%; top:50%;
     width:30px; height:30px; margin:-15px 0 0 -15px; border-radius:50%;
     border:2px solid var(--advisory); animation:ping 1.3s ease-out infinite;
   }
   @keyframes ping{0%{transform:scale(.55);opacity:.9}100%{transform:scale(2.3);opacity:0}}
-  /* magenta target-lock = spoofed telemetry (deliberately different) */
   .drone.spoof .tag{color:var(--spoof)}
   .drone.spoof .arrow{filter:drop-shadow(0 0 5px var(--spoof))}
   .drone.spoof::before{
@@ -278,6 +299,35 @@
   }
   @keyframes lock{to{transform:rotate(360deg)}}
   @keyframes hazard{0%,100%{opacity:.35;transform:scale(.9)}50%{opacity:1;transform:scale(1.15)}}
+
+  /* true_pos: the real aircraft position during a GPS spoof.
+     Orange arrow, no animation rings — it IS the ground truth, not an anomaly.
+     Dashed ring to distinguish it from a normal drone at a glance. */
+  .drone.true-pos .arrow{
+    border-bottom-color: #ff6600;
+    filter: drop-shadow(0 0 5px #ff6600);
+  }
+  .drone.true-pos::before{
+    content:""; position:absolute; left:50%; top:50%;
+    width:28px; height:28px; margin:-14px 0 0 -14px; border-radius:50%;
+    border:1.5px dashed #ff6600; opacity:.75;
+  }
+  .drone.true-pos .tag{ color:#ff6600; }
+
+  /* abbreviated alert badges shown directly on the drone marker */
+  .drone .badges{
+    position:absolute; left:50%; top:26px;
+    transform:translateX(-50%);
+    display:flex; flex-direction:column; align-items:center; gap:2px;
+    pointer-events:none;
+  }
+  .badge{
+    font:700 8px var(--data); letter-spacing:.5px;
+    padding:1px 4px; border-radius:3px; white-space:nowrap;
+    line-height:1.4;
+  }
+  .badge-spoof{ background:rgba(255,46,126,.85); color:#fff; }
+  .badge-alert{ background:rgba(242,177,52,.85); color:#1a1206; }
 
   .deliv-badge{font:700 11px system-ui; color:var(--ok); white-space:nowrap;
     text-shadow:0 0 6px #000,0 0 6px #000; animation:deliv 3s ease-out forwards}
@@ -301,35 +351,41 @@
 </head>
 <body>
   <div id="panel">
-    <div class="head">
-      <div class="title">FRISCO<span class="fx">·</span>UTM</div>
-      <div class="sub">Airspace Surveillance</div>
-      <div class="live"><span class="dot pulse"></span><span id="status">connecting…</span></div>
+    <div id="panel-top">
+      <div class="head">
+        <div class="title">FRISCO<span class="fx">·</span>UTM</div>
+        <div class="sub">Airspace Surveillance</div>
+        <div class="live"><span class="dot pulse"></span><span id="status">connecting…</span></div>
+      </div>
+
+      <div id="condition">
+        <span class="lead">Condition</span>
+        <span id="cond-word">—</span>
+        <span id="cond-note"></span>
+      </div>
+
+      <div class="totals">
+        <div class="stat"><div class="n" id="t-active">0</div><div class="l">Active</div></div>
+        <div class="stat"><div class="n" id="t-total">0</div><div class="l">Tracked</div></div>
+        <div class="stat"><div class="n" id="t-deliv">0</div><div class="l">Delivered</div></div>
+      </div>
     </div>
 
-    <div id="condition">
-      <span class="lead">Condition</span>
-      <span id="cond-word">—</span>
-      <span id="cond-note"></span>
-    </div>
+    <div id="panel-body">
+      <div class="sec" id="security"></div>
+      <div class="sec" id="alerts"></div>
 
-    <div class="totals">
-      <div class="stat"><div class="n" id="t-active">0</div><div class="l">Active</div></div>
-      <div class="stat"><div class="n" id="t-total">0</div><div class="l">Tracked</div></div>
-      <div class="stat"><div class="n" id="t-deliv">0</div><div class="l">Delivered</div></div>
-    </div>
+      <div class="fleets" id="fleets"></div>
 
-    <div class="sec" id="security"></div>
-    <div class="sec" id="alerts"></div>
-
-    <div class="fleets" id="fleets"></div>
-
-    <div class="legend">
-      <div><span class="k">▲</span> drone (arrow = heading)</div>
-      <div><span class="k">◯</span> ringed = real autopilot (SITL)</div>
-      <div><span class="k" style="color:var(--spoof)">◎</span> spoofed telemetry (target-locked)</div>
-      <div><span class="k">◆</span> company depot</div>
-      <div><span class="k" style="color:#ff5a5a">⛔</span> no-fly zone</div>
+      <div class="legend">
+        <div><span class="k">▲</span> drone (arrow = heading)</div>
+        <div><span class="k">◯</span> ringed = real autopilot (SITL)</div>
+        <div><span class="k" style="color:var(--spoof)">◎</span> spoofed telemetry (target-locked)</div>
+        <div><span class="k" style="color:#ff6600">◌</span> true position (GPS spoof victim)</div>
+        <div><span class="k">◆</span> company depot</div>
+        <div><span class="k" style="color:#ff5a5a">⛔</span> no-fly zone</div>
+        <div><span class="k" style="color:#22d3ee">┅</span> flight plan (on hover)</div>
+      </div>
     </div>
   </div>
   <div id="map"></div>
@@ -348,7 +404,6 @@
     </div>
   </div>
 
-  <!-- Stays put after the toast is dismissed, as long as the alert is still active. -->
   <div id="sec-reopen">
     <span class="dot"></span>
     <span id="sec-reopen-count"></span>
@@ -356,12 +411,28 @@
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
-    // ---- security vocabulary (mirrors utm_guardian detector codes) ----
     const SEC_LABEL = {
-      GHOST_ID:'Ghost aircraft', SRC_CONFLICT:'Duplicate source',
+      GHOST_ID:'Ghost aircraft', SRC_CONFLICT:'Unknown source',
       TELEPORT:'Position jump', CLIMB_RATE:'Impossible climb',
       VEL_MISMATCH:'Speed mismatch', FLEET_GUIDED:'Fleet takeover',
+      SRC_HANDOFF:'Source handoff', GPS_SPOOF:'GPS position spoof',
+      OUT_AO:'Outside area of ops',
     };
+    // Short codes shown directly on the drone marker icon.
+    const BADGE_LABEL = {
+      GHOST_ID:'GHOST - POSSIBLE COLLISION DETECTED!', SRC_CONFLICT:'SRC×2', TELEPORT:'TELE',
+      CLIMB_RATE:'CLIMB', VEL_MISMATCH:'VEL', FLEET_GUIDED:'GUIDED',
+      SRC_HANDOFF:'HNDOF', GPS_SPOOF:'GPS', OUT_AO:'OUT-AO',
+    };
+    // Short amber badge shown on the marker for a flight-rule (advisory) code.
+    // Mirrors anomalyLabel()'s vocabulary: HIGH/LOW/OUT_AO/NOFLY:<name>.
+    function FLIGHT_BADGE_LABEL(code){
+      if(code === 'HIGH')           return 'HIGH';
+      if(code === 'LOW')            return 'LOW';
+      if(code === 'OUT_AO')         return 'OUT-AO';
+      if(code.startsWith('NOFLY:')) return 'NOFLY';
+      return code;
+    }
     const isSpoofStr = s => typeof s === 'string' && s.startsWith('SPOOF');
     const isSecCode  = c => c in SEC_LABEL;
     const cleanSpoof = s => s.replace(/^SPOOF\s*[—-]\s*/, '');
@@ -372,23 +443,80 @@
       attribution:'&copy; OpenStreetMap &copy; CARTO', subdomains:'abcd', maxZoom:19
     }).addTo(map);
 
-    const droneMarkers = {}, trails = {};
+    const droneMarkers = {}, trails = {}, trueTrails = {};
+    const latest = {}, latestTrue = {};
+    let hoverKey = null, planLine = null;
     const shownDelivery = {};
     let firstDeliveryScan = true, depotsDrawn = false, zonesDrawn = false;
     const TRAIL_MAX = 80;
-    let dismissedThreats = new Set();
+    let lastResetToken = null;
+
+    function clearTrails(){
+      Object.keys(trails).forEach(k=>{
+        map.removeLayer(trails[k]); delete trails[k];
+      });
+      Object.keys(trueTrails).forEach(k=>{
+        map.removeLayer(trueTrails[k]); delete trueTrails[k];
+      });
+      Object.keys(droneMarkers).filter(k=>k.startsWith('true_')).forEach(k=>{
+        map.removeLayer(droneMarkers[k]); delete droneMarkers[k];
+        delete latestTrue[k];
+      });
+      hoverKey = null;
+      hidePlan();
+    }
+
+    // Dedicated pane that sits below the default overlayPane (z 400) so all
+    // trails are always rendered behind every marker.
+    map.createPane('trailPane');
+    map.getPane('trailPane').style.zIndex = 350;
+    map.getPane('trailPane').style.pointerEvents = 'none';
+
+    // planLine: shown only while hovering a drone marker, in trailPane so it
+    // sits behind markers. hoverKey is either a numeric sysid (normal drone)
+    // or a string "true_<sysid>" (true_pos ghost).
+
+    function showPlan(key){
+      // Never show a plan line for true_pos ghosts or any spoofed/anomaly drone —
+      // a hacked drone's declared plan can't be trusted.
+      if(typeof key === 'string' && key.startsWith('true_')){ hidePlan(); return; }
+      const d = latest[key];
+      if(!d || d._spoof){ hidePlan(); return; }
+      if(!d.plan || d.plan.length < 2){ hidePlan(); return; }
+      if(planLine){
+        planLine.setLatLngs(d.plan);
+        planLine.setStyle({color:'#ffffff'});
+      } else {
+        planLine = L.polyline(d.plan, {
+          color:'#ffffff', weight:1.5, dashArray:'4 8', opacity:.9,
+          interactive:false, pane:'trailPane',
+        }).addTo(map);
+      }
+    }
+    function hidePlan(){ if(planLine){ map.removeLayer(planLine); planLine = null; } }
+
+    let comparedIds = new Set();  // sysids already auto-opened in the /compare tab
+    function maybeAutoCompare(flaggedList){
+      const stillFlagged = new Set(flaggedList.map(d=>d.sysid));
+      [...comparedIds].forEach(sid=>{ if(!stillFlagged.has(sid)) comparedIds.delete(sid); });
+      flaggedList.forEach(d=>{
+        if(d.declared_plan && d.declared_plan.length >= 2 && !comparedIds.has(d.sysid)){
+          comparedIds.add(d.sysid);
+          try{ window.open(`/compare?sysid=${d.sysid}`, '_blank'); }catch(e){ }
+        }
+      });
+    }
+    let dismissedThreats = new Set();  // dismissed (sysid::code) threat keys
     let currentFlaggedIds = [];
+    let currentThreatKeys = new Set();
     const toast = document.getElementById('sec-toast');
     const reopenChip = document.getElementById('sec-reopen');
     const reopenCount = document.getElementById('sec-reopen-count');
 
-    // Dismissing hides the card but does NOT clear the alert — the reopen
-    // chip stays in the corner as long as the underlying threat is still
-    // active, so a swipe/tap never actually loses information.
     function dismissToast(){
       toast.classList.remove('show');
       toast.style.transform = ''; toast.style.opacity = '';
-      dismissedThreats = new Set(currentFlaggedIds);
+      dismissedThreats = new Set(currentThreatKeys);
       if(currentFlaggedIds.length){
         reopenCount.textContent = `${currentFlaggedIds.length} flagged — tap to view`;
         reopenChip.classList.add('show');
@@ -403,8 +531,6 @@
     document.getElementById('sec-toast-close').addEventListener('click', dismissToast);
     reopenChip.addEventListener('click', reopenToast);
 
-    // Swipe-to-dismiss (touch devices): drag the toast sideways, let go past
-    // the threshold and it dismisses; otherwise it springs back into place.
     let dragStartX = null;
     const SWIPE_DISMISS_PX = 80;
     toast.addEventListener('touchstart', e=>{
@@ -435,11 +561,30 @@
     function droneIcon(d){
       const hdg  = (d.hdg==null) ? 0 : d.hdg;
       const ring = d.kind === 'SITL' ? 'ring' : '';
-      const spoof = d._spoof ? 'spoof' : (d.alert ? 'alert' : '');
+      let spoof;
+      if(d.kind === 'true_pos'){
+        spoof = 'true-pos';
+      } else {
+        spoof = d._spoof ? 'spoof' : (d.alert ? 'alert' : '');
+      }
+      const arrowColor = d.kind === 'true_pos' ? '#ff6600' : d.color;
+
+      // Marker badge strip: amber flight-rule codes only. The magenta spoof
+      // "red icons" were removed from hacked drones — the rotating hacked ring
+      // already flags them, and the anomaly is named concisely in the hover.
+      let badgesHtml = '';
+      const pills = [];
+      (d.flight_codes || []).forEach(k=>
+        pills.push(`<span class="badge badge-alert">${FLIGHT_BADGE_LABEL(k)}</span>`));
+      if(pills.length){
+        badgesHtml = `<div class="badges">${pills.join('')}</div>`;
+      }
+
       const html =
-        `<div class="drone ${d.status} ${ring} ${spoof}" style="--c:${d.color}">
+        `<div class="drone ${d.status} ${ring} ${spoof}" style="--c:${arrowColor}">
            <div class="arrow" style="transform:rotate(${hdg}deg)"></div>
-           <div class="tag">${d.sysid}</div>
+           <div class="tag">${d.kind === 'true_pos' ? '⬡'+d.sysid : d.sysid}</div>
+           ${badgesHtml}
          </div>`;
       return L.divIcon({html, className:'drone-icon', iconSize:[30,30], iconAnchor:[15,15]});
     }
@@ -448,13 +593,18 @@
       const h = d.hdg==null ? '—' : d.hdg.toFixed(0)+'°';
       const mode = d.mode || '—';
       const batt = (d.battery==null) ? '—' : d.battery+'%';
-      const spoofMsgs  = (d.alerts||[]).filter(isSpoofStr).map(cleanSpoof);
-      const flightMsgs = (d.alerts||[]).filter(a=>!isSpoofStr(a));
+      const lat = d.lat != null ? d.lat.toFixed(5) : '—';
+      const lon = d.lon != null ? d.lon.toFixed(5) : '—';
+      // Anomalies named in a few words (from the codes), no icons — hover only.
+      let secLabels = (d.codes || []).map(c => SEC_LABEL[c] || c);
+      if(!secLabels.length && (d.alerts||[]).some(isSpoofStr)) secLabels = ['spoofed'];
+      const flightLabels = (d.flight_codes || []).map(c => anomalyLabel(c));
       return `<b style="color:${d.color}">${d.company} · #${d.sysid}</b><br>`
            + `<span class="data">alt ${d.alt_m} m &nbsp; ${d.speed_ms} m/s &nbsp; ${h}</span><br>`
-           + `<span class="data">${mode} &nbsp; batt ${batt}</span>`
-           + (spoofMsgs.length ? '<br><span style="color:#ff2e7e">⊘ SPOOF: '+spoofMsgs.join('<br>⊘ ')+'</span>' : '')
-           + (flightMsgs.length ? '<br><span style="color:#f2b134">⚠ '+flightMsgs.join('<br>⚠ ')+'</span>' : '')
+           + `<span class="data">${mode} &nbsp; batt ${batt}</span><br>`
+           + `<span class="data" style="color:var(--muted)">${lat}, ${lon}</span>`
+           + (secLabels.length ? `<br><span style="color:#ff2e7e">${secLabels.join(', ')}</span>` : '')
+           + (flightLabels.length ? `<br><span style="color:#f2b134">${flightLabels.join(', ')}</span>` : '')
            + (d.status==='stale' ? '<br><i>signal lost</i>' : '');
     }
 
@@ -484,12 +634,12 @@
     function drawZones(data){
       (data.areas||[]).forEach(a=>{
         L.polygon(a.polygon, {color:a.color, weight:2, dashArray:'6 7',
-          fill:false, interactive:false}).addTo(map);
+          fill:false, interactive:false, pane:'trailPane'}).addTo(map);
         textLabel(a.label, `${a.company.toUpperCase()} AO`, 'ao', a.color, a.label_dir).addTo(map);
       });
       (data.nofly||[]).forEach(z=>{
         L.circle([z.lat,z.lon], {radius:z.radius_m, color:'#ff5a5a', weight:1.5,
-          fillColor:'#ff5a5a', fillOpacity:0.12, interactive:false}).addTo(map);
+          fillColor:'#ff5a5a', fillOpacity:0.12, interactive:false, pane:'trailPane'}).addTo(map);
         textLabel([z.lat,z.lon], `⛔ ${z.name}`, 'nfz', null, 'center').addTo(map);
       });
     }
@@ -498,35 +648,102 @@
       if(!zonesDrawn && data.areas){ drawZones(data); zonesDrawn = true; }
       if(!depotsDrawn && data.depots){ drawDepots(data); depotsDrawn = true; }
       const seen = new Set();
+      const seenTrue = new Set();
+
+      // Tag _spoof on every drone object (all kinds) so updateSecurity can see them.
       data.drones.forEach(d=>{
         d._spoof = (d.alerts||[]).some(isSpoofStr);
+      });
+
+      // --- PASS 1: normal drones (not true_pos ghosts) ---
+      data.drones.filter(d => d.kind !== 'true_pos').forEach(d=>{
         seen.add(d.sysid);
+        latest[d.sysid] = d;
         const ll = [d.lat, d.lon];
 
+        // Trail always in trailPane, always company color (not magenta when spoofed —
+        // the marker's spoof ring already signals the anomaly; the trail stays legible).
         if(!trails[d.sysid]){
-          trails[d.sysid] = L.polyline([], {color:d.color, weight:2, opacity:.45}).addTo(map);
+          trails[d.sysid] = L.polyline([], {
+            color: d.color, weight: 2, opacity: .45,
+            pane: 'trailPane', interactive: false,
+          }).addTo(map);
           trails[d.sysid]._pts = [];
         }
         const tr = trails[d.sysid];
         tr._pts.push(ll); if(tr._pts.length>TRAIL_MAX) tr._pts.shift();
         tr.setLatLngs(tr._pts);
-        tr.setStyle({color: d._spoof ? '#ff2e7e' : d.color, opacity: d._spoof ? .7 : .45});
+        // Keep company color at all times; just dim slightly when stale.
+        tr.setStyle({color: d.color, opacity: d.status === 'stale' ? .2 : .45});
 
         if(!droneMarkers[d.sysid]){
-          droneMarkers[d.sysid] = L.marker(ll,{icon:droneIcon(d)}).addTo(map)
+          const key = d.sysid;
+          const mk = L.marker(ll,{icon:droneIcon(d)}).addTo(map)
             .bindTooltip(tip(d),{direction:'top',offset:[0,-14]});
+          mk.on('mouseover', ()=>{ hoverKey = key; showPlan(key); });
+          mk.on('mouseout',  ()=>{ if(hoverKey===key){ hoverKey = null; hidePlan(); } });
+          droneMarkers[d.sysid] = mk;
         }
+        latest[d.sysid] = d;
         const m = droneMarkers[d.sysid];
         m.setLatLng(ll); m.setIcon(droneIcon(d)); m.setTooltipContent(tip(d));
       });
-      Object.keys(droneMarkers).forEach(sid=>{
+
+      // --- PASS 2: true_pos ghosts (GPS spoof victim's real position) ---
+      // Keyed as `true_<sysid>` so they don't clobber the spoofed marker.
+      data.drones.filter(d => d.kind === 'true_pos').forEach(d=>{
+        const key = 'true_' + d.sysid;
+        seenTrue.add(key);
+        const ll = [d.lat, d.lon];
+
+        // Orange dashed trail in trailPane — visually distinct from the normal fleet.
+        if(!trueTrails[key]){
+          trueTrails[key] = L.polyline([], {
+            color: '#ff6600', weight: 2, opacity: .65,
+            dashArray: '4 7', pane: 'trailPane', interactive: false,
+          }).addTo(map);
+          trueTrails[key]._pts = [];
+        }
+        const tr = trueTrails[key];
+        tr._pts.push(ll); if(tr._pts.length>TRAIL_MAX) tr._pts.shift();
+        tr.setLatLngs(tr._pts);
+
+        if(!droneMarkers[key]){
+          droneMarkers[key] = L.marker(ll, {icon: droneIcon(d)}).addTo(map)
+            .bindTooltip(tip(d), {direction:'top', offset:[0,-14]});
+          droneMarkers[key].on('mouseover', ()=>{ hoverKey = key; showPlan(key); });
+          droneMarkers[key].on('mouseout',  ()=>{ if(hoverKey===key){ hoverKey = null; hidePlan(); } });
+        }
+        latestTrue[key] = d;
+        const m = droneMarkers[key];
+        m.setLatLng(ll); m.setIcon(droneIcon(d)); m.setTooltipContent(tip(d));
+      });
+
+      if(hoverKey !== null) showPlan(hoverKey);
+
+      // Clean up vanished normal drones.
+      Object.keys(droneMarkers).filter(k => !k.startsWith('true_')).forEach(sid=>{
         if(!seen.has(+sid)){
           map.removeLayer(droneMarkers[sid]); delete droneMarkers[sid];
           if(trails[sid]){ map.removeLayer(trails[sid]); delete trails[sid]; }
+          delete latest[sid];
+          if(hoverKey === +sid){ hoverKey = null; hidePlan(); }
+        }
+      });
+      // Clean up vanished true_pos markers.
+      Object.keys(droneMarkers).filter(k => k.startsWith('true_')).forEach(key=>{
+        if(!seenTrue.has(key)){
+          map.removeLayer(droneMarkers[key]); delete droneMarkers[key];
+          if(trueTrails[key]){ map.removeLayer(trueTrails[key]); delete trueTrails[key]; }
+          delete latestTrue[key];
+          if(hoverKey === key){ hoverKey = null; hidePlan(); }
         }
       });
 
       data.drones.forEach(d=>{
+        // Delivered badge is for unhacked drones only — a hijacked drone's
+        // telemetry (including any "delivered" signal) can't be trusted.
+        if(d._spoof) return;
         if(!d.delivered_ts) return;
         if(firstDeliveryScan){ shownDelivery[d.sysid] = d.delivered_ts; return; }
         if(shownDelivery[d.sysid] !== d.delivered_ts){
@@ -537,17 +754,11 @@
       firstDeliveryScan = false;
     }
 
-    // ---- worst-state escalation drives the whole console ----
     function updateCondition(data){
-      const sec = data.security || {flagged:0};
-      const flaggedList = data.drones.filter(d=>d._spoof);
-      const spoofed = (sec.flagged||0) > 0 || flaggedList.length > 0;
+      const sec = data.security || {};
+      const count = sec.flagged || 0;
+      const spoofed = count > 0;
       const advisory = (data.alerting||0) > 0;
-      // NOTE: this only sets a CSS class on <body> (cond-nominal / cond-advisory /
-      // cond-security). That class just tints the sidebar (condition word, the
-      // side-rail glow) — it never hides or dims the map or the panel. The
-      // sidebar's Security section (below) keeps showing its own live state —
-      // including the "No intrusions detected" NOMINAL line — at all times.
       const b = document.body;
       b.classList.remove('cond-nominal','cond-advisory','cond-security');
       const word = document.getElementById('cond-word');
@@ -558,34 +769,49 @@
       if(spoofed){
         b.classList.add('cond-security'); word.textContent = 'SECURITY';
         note.textContent = 'spoofed telemetry detected';
-        toastCount.textContent = `${flaggedList.length} aircraft compromised`;
-        // Same "swatch + company + sysid" identity used in the fleet roster below,
-        // so a flagged aircraft in the toast is recognizable at a glance.
-        toastThreats.innerHTML = flaggedList.map(d=>{
-          const msgs = (d.alerts||[]).filter(isSpoofStr).map(cleanSpoof).join(' · ');
+        const flaggedSysids = sec.flagged_sysids || [];
+        toastCount.textContent = `${flaggedSysids.length} aircraft compromised`;
+        // Build toast from drones with codes
+        const seen = new Map();
+        data.drones.forEach(d=>{
+          if(flaggedSysids.includes(d.sysid) && (!seen.has(d.sysid)||d.kind==='sim'||d.kind==='SITL'))
+            seen.set(d.sysid, d);
+        });
+        toastThreats.innerHTML = [...seen.values()].map(d=>{
+          const badges = (d.codes||[]).map(k=>BADGE_LABEL[k]||k).join(' · ');
           return `<div class="threat-item">`
                + `<span class="sw" style="background:${d.color}"></span>`
                + `<span class="lbl">`
                +   `<span class="who">${d.company} <span class="co">#${d.sysid}</span></span>`
-               +   `<span class="what">${msgs}</span>`
+               +   `<span class="what">${badges}</span>`
                + `</span></div>`;
         }).join('');
-        currentFlaggedIds = flaggedList.map(d=>d.sysid);
-        // Only pop the toast back up for aircraft the person hasn't already
-        // swiped/tapped away — an ongoing known alert won't keep re-appearing
-        // uninvited, but the reopen chip stays available the whole time.
-        const hasNewThreat = currentFlaggedIds.some(id=>!dismissedThreats.has(id));
+        currentFlaggedIds = flaggedSysids;
+        // Track dismissal per (aircraft, threat code) — not just per aircraft —
+        // so a drone that's already been dismissed for one attack still pops
+        // the toast again if it's later flagged for a DIFFERENT code (e.g.
+        // #3 dismissed for CLIMB_RATE earlier, then later hit with
+        // FLEET_GUIDED). Keying only on sysid would silently swallow that
+        // second, distinct security event.
+        currentThreatKeys = new Set();
+        [...seen.values()].forEach(d=>{
+          (d.codes && d.codes.length ? d.codes : ['?']).forEach(code=>{
+            currentThreatKeys.add(`${d.sysid}::${code}`);
+          });
+        });
+        maybeAutoCompare([...seen.values()]);
+        const hasNewThreat = [...currentThreatKeys].some(key=>!dismissedThreats.has(key));
         if(hasNewThreat){
           toast.classList.add('show'); toast.style.transform=''; toast.style.opacity='';
           reopenChip.classList.remove('show');
         } else if(!toast.classList.contains('show')){
-          // still spoofed, still dismissed — keep the reopen chip visible/updated
           reopenCount.textContent = `${currentFlaggedIds.length} flagged — tap to view`;
           reopenChip.classList.add('show');
         }
       } else if(advisory){
         dismissedThreats = new Set();
         currentFlaggedIds = [];
+        currentThreatKeys = new Set();
         toast.classList.remove('show');
         reopenChip.classList.remove('show');
         b.classList.add('cond-advisory'); word.textContent = 'ADVISORY';
@@ -595,46 +821,102 @@
         note.textContent = 'all telemetry verified';
         dismissedThreats = new Set();
         currentFlaggedIds = [];
+        currentThreatKeys = new Set();
         toast.classList.remove('show');
         reopenChip.classList.remove('show');
       }
     }
 
+    // Advisory amber — matches --advisory CSS var.
+    const AMBER = '#f2b134';
+
+    // A notification is a "spoof" event when its text starts with "SPOOF" OR its
+    // code is a known guardian security code. Everything else (HIGH, LOW, NOFLY:*,
+    // OUT_AO from the evaluator) is a flight-rule anomaly.
+    // NOTE: we check the *text* field (not just the code) because ui_selftest
+    // prefixes all alert strings with "SPOOF — " regardless of code, while the
+    // real aggregator uses plain text for flight-rule violations. Using the text
+    // as the discriminator means both backends work correctly.
+    function isSpoof(n){
+      return isSecCode(n.code) || (n.text && n.text.startsWith('SPOOF'));
+    }
+
+    function anomalyLabel(code){
+      if(code === 'HIGH')             return 'Above ceiling';
+      if(code === 'LOW')              return 'Below floor';
+      if(code === 'OUT_AO')           return 'Outside area';
+      if(code.startsWith('NOFLY:'))   return `No-fly: ${code.split(':')[1]}`;
+      return code;
+    }
+
     function updateSecurity(data){
-      const sec = data.security || {flagged_sysids:[], flagged:0, active_by_code:{}};
-      const flagged = data.drones.filter(d=>d._spoof);
-      const count = sec.flagged || flagged.length;
-      let html = `<div class="sec-head">Security`
-               + `<span class="pill ${count?'on':''}">${count}</span></div>`;
-
-      if(count === 0){
-        html += `<div class="sec-ok"><span class="tick">✓</span>No intrusions detected · telemetry verified</div>`;
-        document.getElementById('security').innerHTML = html;
-        return;
-      }
-
+      const el = document.getElementById('security');
+      const sec = data.security || {};
+      const flaggedSysids = new Set(sec.flagged_sysids || []);
       const byCode = sec.active_by_code || {};
-      const chips = Object.keys(byCode).map(c =>
-        `<span class="chip">${SEC_LABEL[c]||c} <span class="x">×${byCode[c]}</span></span>`).join('');
-      if(chips) html += `<div class="chips">${chips}</div>`;
+      const count = sec.flagged || 0;
 
-      flagged.forEach(d=>{
-        const msgs = (d.alerts||[]).filter(isSpoofStr).map(cleanSpoof).join('<br>');
-        html += `<div class="threat"><span class="who">#${d.sysid}</span>`
-              + `<span class="what">${msgs}</span></div>`;
-      });
+      // Split ALL notifications into spoof vs flight-rule by inspecting the text.
+      // The Security section shows ONLY the spoof/security half; flight-rule
+      // anomalies live entirely in the separate Flight-alerts section.
+      const allNotifs = data.notifications || [];
+      const secNotifs   = allNotifs.filter(n => isSpoof(n));
 
-      const log = (data.notifications||[]).filter(n=>isSecCode(n.code)).slice(0,5);
-      if(log.length){
-        html += `<div class="intru-log">`;
-        log.forEach(n=>{
-          const verb = n.kind==='enter' ? '⊘' : '✓';
-          html += `<div class="intru">${verb} #${n.sysid} ${SEC_LABEL[n.code]||n.code} `
-                + `<span class="t">${Math.round(n.ago_s)}s</span></div>`;
-        });
-        html += `</div>`;
+      // ---- section header (security items only) ----
+      let h = `<div class="sec-head">Security<span class="pill ${count?'on':''}">${count}</span></div>`;
+
+      // Nothing security-related — show the clean state.
+      if(count === 0 && !secNotifs.length){
+        h += `<div class="sec-ok"><span class="tick">✓</span>No intrusions detected</div>`;
+        el.innerHTML = h; return;
       }
-      document.getElementById('security').innerHTML = html;
+
+      // ======== SPOOF / SECURITY BLOCK ========
+      if(count > 0 || secNotifs.length){
+
+        // Active code chips.
+        if(Object.keys(byCode).length){
+          h += `<div class="chips">`;
+          Object.entries(byCode).forEach(([c,n])=>{
+            h += `<span class="chip">${SEC_LABEL[c]||c} <span class="x">×${n}</span></span>`;
+          });
+          h += `</div>`;
+        }
+
+        // Per-drone threat summary.
+        if(flaggedSysids.size){
+          const seen = new Map();
+          data.drones.forEach(d=>{
+            if(!flaggedSysids.has(d.sysid)) return;
+            if(!seen.has(d.sysid) || d.kind==='sim' || d.kind==='SITL') seen.set(d.sysid,d);
+          });
+          seen.forEach(d=>{
+            const codes = (d.codes||[]).map(k=>`<span style="background:rgba(255,46,126,.2);color:var(--spoof);font:700 9px var(--data);padding:1px 5px;border-radius:3px;margin-left:4px">${BADGE_LABEL[k]||k}</span>`).join('');
+            h += `<div style="display:flex;align-items:center;padding:4px 0;border-top:1px solid rgba(255,46,126,.12)">`;
+            h += `<span style="font:600 12px var(--data);color:var(--spoof)">${d.company} #${d.sysid}</span>${codes}`;
+            h += `</div>`;
+          });
+        }
+
+        // Spoof notification log.
+        if(secNotifs.length){
+          h += `<div style="margin-top:10px;border-top:1px dashed rgba(255,46,126,.25);padding-top:8px">`;
+          secNotifs.slice(0,12).forEach(n=>{
+            const enter = n.kind==='enter';
+            const verb = enter ? '⊘' : '✓';
+            const col  = enter ? '#ff8fb5' : '#46d17f';
+            const who  = (n.company?n.company+' ':'')+'#'+n.sysid;
+            const body = enter ? cleanSpoof(n.text) : (SEC_LABEL[n.code]||n.code)+' — cleared';
+            h += `<div style="margin-bottom:7px;font-family:var(--data);font-size:10px;color:${col};line-height:1.5">`;
+            h += `<div style="font-weight:600">${verb} ${who} <span style="color:var(--faint);font-weight:400">${Math.round(n.ago_s)}s ago</span></div>`;
+            h += `<div style="padding-left:10px;opacity:.85">${body}</div>`;
+            h += `</div>`;
+          });
+          h += `</div>`;
+        }
+      }
+
+      el.innerHTML = h;
     }
 
     function updatePanel(data){
@@ -668,7 +950,6 @@
     }
 
     function updateAlerts(data){
-      // flight-rule alerts only — spoof alerts live in the SECURITY section
       const active = [];
       data.drones.forEach(d => (d.alerts||[])
         .filter(m=>!isSpoofStr(m))
@@ -678,22 +959,12 @@
       if(active.length === 0){
         html += `<div class="al-none">no active advisories</div>`;
       } else {
-        active.forEach(a=>{
-          html += `<div class="al-row"><span class="sd" style="background:${a.d.color}"></span>`
-                + `<span class="id">#${a.d.sysid}</span>`
-                + `<span class="msg">${a.m}</span></div>`;
-        });
-      }
-      const ev = (data.notifications||[]).filter(n=>!isSecCode(n.code)).slice(0,6);
-      if(ev.length){
-        html += `<div class="al-log">`;
-        ev.forEach(n=>{
-          const icon = n.kind==='enter' ? '⚠' : '✓';
-          const cls  = n.kind==='enter' ? 'ev-enter' : 'ev-clear';
-          html += `<div class="ev ${cls}">${icon} #${n.sysid} ${n.text} `
-                + `<span class="t">${Math.round(n.ago_s)}s</span></div>`;
-        });
-        html += `</div>`;
+        // Show only the FIRST active flight alert (the pill still reflects the
+        // true total so the operator knows how many are in effect).
+        const a = active[0];
+        html += `<div class="al-row"><span class="sd" style="background:${a.d.color}"></span>`
+              + `<span class="id">#${a.d.sysid}</span>`
+              + `<span class="msg">${a.m}</span></div>`;
       }
       document.getElementById('alerts').innerHTML = html;
     }
@@ -702,7 +973,11 @@
       try{
         const r = await fetch('/api/drones', {cache:'no-store'});
         const data = await r.json();
-        updateDrones(data);       // sets d._spoof, used by the rest
+        if(data.reset_token !== undefined && data.reset_token !== lastResetToken){
+          if(lastResetToken !== null) clearTrails();
+          lastResetToken = data.reset_token;
+        }
+        updateDrones(data);       
         updateCondition(data);
         updateSecurity(data);
         updateAlerts(data);

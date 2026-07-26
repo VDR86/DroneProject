@@ -34,10 +34,12 @@ it can be unit-tested with plain Python values (see test_guardian.py). The
 aggregator parses each MAVLink message, hands the fields to `observe()`, and
 later folds `assess()` into its own alert table.
 
-Detects seven things: GHOST_ID, SRC_CONFLICT, TELEPORT, CLIMB_RATE,
-VEL_MISMATCH, FLEET_GUIDED, and SRC_HANDOFF (a source change after the
-previous one had already gone quiet -- the gap SRC_CONFLICT can't see, since
-SRC_CONFLICT only fires while two sources are simultaneously live).
+Detects nine things: GHOST_ID, SRC_CONFLICT, TELEPORT, CLIMB_RATE,
+VEL_MISMATCH, FLEET_GUIDED, SRC_HANDOFF (a source change after the previous
+one had already gone quiet), GPS_SPOOF (reported heading inconsistent with the
+movement vector implied by consecutive position fixes — the fingerprint of an
+injected false position), and OUT_AO (reported position outside the drone's
+company area of operations, when ao_polygons/ao_sysid_company are supplied).
 
 Two-phase flow, mirroring the aggregator's own ingest/evaluate split:
   observe()  -- called on every message; cheap; just records history
@@ -64,6 +66,37 @@ def _haversine_m(lat1, lon1, lat2, lon2):
     a = (math.sin(d_phi / 2) ** 2
          + math.cos(p1) * math.cos(p2) * math.sin(d_lam / 2) ** 2)
     return 2 * r * math.asin(math.sqrt(a))
+
+
+def _bearing_deg(lat1, lon1, lat2, lon2):
+    """Initial bearing (degrees, 0–360) from point 1 to point 2."""
+    d_lon = math.radians(lon2 - lon1)
+    y = math.sin(d_lon) * math.cos(math.radians(lat2))
+    x = (math.cos(math.radians(lat1)) * math.sin(math.radians(lat2))
+         - math.sin(math.radians(lat1)) * math.cos(math.radians(lat2))
+         * math.cos(d_lon))
+    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+
+def _angle_diff(a, b):
+    """Signed shortest angular difference (a − b) in degrees, in (−180, 180]."""
+    d = (a - b) % 360.0
+    return d - 360.0 if d > 180.0 else d
+
+
+def _point_in_poly(lat, lon, poly):
+    """Ray-casting point-in-polygon test. poly is [(lat, lon), ...]."""
+    inside = False
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        yi, xi = poly[i]
+        yj, xj = poly[j]
+        if ((yi > lat) != (yj > lat)) and \
+           (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
 
 
 class Guardian:
@@ -103,6 +136,23 @@ class Guardian:
         guided_window_s=3.0,  # Cluster width for the synchronized-GUIDED test.
         guided_fleet_n=3,     # This many near-simultaneous GUIDED switches
                               # inside guided_window_s counts as a takeover.
+        # --- GPS spoof / heading consistency ---------------------------------
+        hdg_tol_deg=60.0,     # Max acceptable angle between the drone's reported
+                              # heading and the bearing implied by consecutive
+                              # position fixes. Random GPS scatter and gentle turns
+                              # can produce short disagreements; we require a
+                              # sustained streak (hdg_sustain samples) before
+                              # calling it a spoof.
+        hdg_sustain=4,        # Consecutive disagreeing samples required.
+        hdg_min_dist_m=5.0,   # Don't compare heading when the drone barely moved
+                              # (division by near-zero distance is unreliable, and
+                              # a hovering drone's heading is arbitrary anyway).
+        # --- area-of-operations check ----------------------------------------
+        ao_polygons=None,     # Optional {company: [(lat, lon), ...]} mapping.
+                              # When supplied, drones outside their company's AO
+                              # polygon are flagged OUT_AO. Pass None to skip.
+        ao_sysid_company=None,  # {sysid: company} so the check knows which polygon
+                              # to test each drone against.
         # --- bookkeeping ------------------------------------------------------
         history=64,           # Fixes retained per drone.
     ):
@@ -116,9 +166,14 @@ class Guardian:
         self.handoff_hold_s = handoff_hold_s
         self.guided_window_s = guided_window_s
         self.guided_fleet_n = guided_fleet_n
+        self.hdg_tol_deg = hdg_tol_deg
+        self.hdg_sustain = hdg_sustain
+        self.hdg_min_dist_m = hdg_min_dist_m
+        self.ao_polygons = ao_polygons or {}
+        self.ao_sysid_company = ao_sysid_company or {}
 
         # --- rolling state, all keyed by system id ---------------------------
-        # Recent position fixes: sysid -> deque of (t, lat, lon, alt_m, speed_ms)
+        # Recent position fixes: sysid -> deque of (t, lat, lon, alt_m, speed_ms, hdg)
         self._fixes = defaultdict(lambda: deque(maxlen=history))
         # Last time each network source was heard for a sysid: sysid -> {src: t}
         self._srcs = defaultdict(dict)
@@ -132,12 +187,14 @@ class Guardian:
         self._guided_at = {}
         # Running count of disagreeing speed samples: sysid -> int
         self._vel_bad = defaultdict(int)
+        # Running count of heading-vs-delta disagreements: sysid -> int
+        self._hdg_bad = defaultdict(int)
 
     # =====================================================================
     # INGEST  -- called for every message; keep it cheap
     # =====================================================================
     def observe(self, sysid, mtype, *, t, lat=None, lon=None, alt_m=None,
-                speed_ms=None, mode=None, src=None):
+                speed_ms=None, hdg=None, mode=None, src=None):
         """Record one parsed MAVLink message.
 
         Parameters
@@ -159,7 +216,7 @@ class Guardian:
             self._note_src(sysid, src, t)
 
         if mtype == "GLOBAL_POSITION_INT" and lat is not None and lon is not None:
-            self._fixes[sysid].append((t, lat, lon, alt_m, speed_ms))
+            self._fixes[sysid].append((t, lat, lon, alt_m, speed_ms, hdg))
 
         elif mtype == "HEARTBEAT" and mode is not None:
             self._note_mode(sysid, mode, t)
@@ -213,6 +270,7 @@ class Guardian:
             self._check_src_handoff(out, sysid, now)
             if sysid in self._fixes:
                 self._check_kinematics(out, sysid, self._fixes[sysid])
+                self._check_ao(out, sysid, self._fixes[sysid])
 
         # Fleet-wide detector (needs to see all drones at once).
         self._check_fleet_takeover(out)
@@ -258,11 +316,11 @@ class Guardian:
 
     def _check_kinematics(self, out, sysid, fixes):
         """Physics checks over the two most recent fixes: teleport, climb rate,
-        and reported-speed-vs-track agreement."""
+        reported-speed-vs-track agreement, and heading-vs-movement-vector."""
         if len(fixes) < 2:
             return
-        t0, la0, lo0, al0, _sp0 = fixes[-2]
-        t1, la1, lo1, al1, sp1 = fixes[-1]
+        t0, la0, lo0, al0, _sp0, _h0 = fixes[-2]
+        t1, la1, lo1, al1,  sp1,  h1 = fixes[-1]
         dt = t1 - t0
         if dt <= 0:
             return  # duplicate/out-of-order timestamps: nothing to derive
@@ -301,6 +359,56 @@ class Guardian:
                                f"{derived_speed:.0f} m/s")
             else:
                 self._vel_bad[sysid] = 0  # agreement resets the streak
+
+        # GPS_SPOOF: the drone's reported heading should roughly agree with
+        # the bearing implied by where its position actually moved. A GPS
+        # spoofer that injects a false position while leaving the drone's own
+        # reported heading untouched (or vice versa) produces a sustained
+        # angular disagreement that is hard to explain by normal flight.
+        #
+        # Conditions for skipping:
+        #   * No reported heading in this fix (hdg field was 65535 / None).
+        #   * The drone barely moved — bearing from near-zero dist is noisy.
+        #   * The position itself was flagged as a teleport (that case is
+        #     already owned by TELEPORT; don't double-count).
+        if (h1 is not None
+                and dist >= self.hdg_min_dist_m
+                and derived_speed <= self.max_speed_ms):
+            delta_bearing = _haversine_m(la0, lo0, la1, lo1)  # nonzero, confirmed
+            track_bearing = _bearing_deg(la0, lo0, la1, lo1)
+            hdg_diff = abs(_angle_diff(h1, track_bearing))
+            if hdg_diff > self.hdg_tol_deg:
+                self._hdg_bad[sysid] += 1
+                if self._hdg_bad[sysid] >= self.hdg_sustain:
+                    self._flag(out, sysid, "GPS_SPOOF",
+                               f"#{sysid} heading {h1:.0f}° disagrees with "
+                               f"track bearing {track_bearing:.0f}° "
+                               f"({hdg_diff:.0f}° > {self.hdg_tol_deg:.0f}°) "
+                               f"— possible GPS position spoof")
+            else:
+                self._hdg_bad[sysid] = 0  # agreement resets the streak
+
+    def _check_ao(self, out, sysid, fixes):
+        """OUT_AO: the drone's latest reported position is outside its company's
+        area of operations polygon.
+
+        This mirrors the aggregator's own AO check but runs inside the Guardian
+        so it is independently derived from raw telemetry and feeds the security
+        alert pathway. It is only active when ao_polygons and ao_sysid_company
+        were supplied at construction time — skipped silently otherwise."""
+        if not self.ao_polygons or sysid not in self.ao_sysid_company:
+            return
+        company = self.ao_sysid_company[sysid]
+        poly = self.ao_polygons.get(company)
+        if not poly:
+            return
+        if not fixes:
+            return
+        _t, lat, lon, *_ = fixes[-1]
+        if not _point_in_poly(lat, lon, poly):
+            self._flag(out, sysid, "OUT_AO",
+                       f"#{sysid} ({company}) reported position outside "
+                       f"{company} area of operations")
 
     def _check_fleet_takeover(self, out):
         """Several drones entering GUIDED inside one narrow window.
