@@ -2,7 +2,7 @@
 utm_guardian.py
 ===============
 
-Spoof-resistance layer for the Frisco UTM aggregator.
+Attack-resistance layer for the Frisco UTM aggregator.
 
 Purpose
 -------
@@ -24,7 +24,7 @@ Scope
 -----
 DEFENSIVE ONLY. The Guardian consumes telemetry the aggregator already receives
 and returns alert strings. It never transmits, never commands a vehicle, and
-contains no knowledge of how a spoof is produced. It is a smoke detector, not a
+contains no knowledge of how an attack is produced. It is a smoke detector, not a
 fire.
 
 Design notes
@@ -36,7 +36,7 @@ later folds `assess()` into its own alert table.
 
 Detects nine things: GHOST_ID, SRC_CONFLICT, TELEPORT, CLIMB_RATE,
 VEL_MISMATCH, FLEET_GUIDED, SRC_HANDOFF (a source change after the previous
-one had already gone quiet), GPS_SPOOF (reported heading inconsistent with the
+one had already gone quiet), GPS_ATTACK (reported heading inconsistent with the
 movement vector implied by consecutive position fixes — the fingerprint of an
 injected false position), and OUT_AO (reported position outside the drone's
 company area of operations, when ao_polygons/ao_sysid_company are supplied).
@@ -51,7 +51,7 @@ import math
 
 # Every security message starts with this token so it is visually distinct from
 # the aggregator's flight-rule alerts (altitude, no-fly, area) in the same UI.
-SEC_PREFIX = "SPOOF"
+SEC_PREFIX = "ATTACK"
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +100,7 @@ def _point_in_poly(lat, lon, poly):
 
 
 class Guardian:
-    """Stateful spoof detector for one UTM aggregator.
+    """Stateful attack detector for one UTM aggregator.
 
     Feed it parsed telemetry via observe(); poll it via assess(). It keeps a
     short rolling history per drone and derives every judgement from that
@@ -136,13 +136,13 @@ class Guardian:
         guided_window_s=3.0,  # Cluster width for the synchronized-GUIDED test.
         guided_fleet_n=3,     # This many near-simultaneous GUIDED switches
                               # inside guided_window_s counts as a takeover.
-        # --- GPS spoof / heading consistency ---------------------------------
+        # --- GPS attack / heading consistency ---------------------------------
         hdg_tol_deg=60.0,     # Max acceptable angle between the drone's reported
                               # heading and the bearing implied by consecutive
                               # position fixes. Random GPS scatter and gentle turns
                               # can produce short disagreements; we require a
                               # sustained streak (hdg_sustain samples) before
-                              # calling it a spoof.
+                              # calling it an attack.
         hdg_sustain=4,        # Consecutive disagreeing samples required.
         hdg_min_dist_m=5.0,   # Don't compare heading when the drone barely moved
                               # (division by near-zero distance is unreliable, and
@@ -343,7 +343,7 @@ class Guardian:
                            f"(> {self.max_climb_ms:.0f})")
 
         # VEL_MISMATCH: the drone's *reported* ground speed should match the
-        # speed implied by where it actually moved. A spoofer that forges
+        # speed implied by where it actually moved. An attacker that forges
         # position but leaves the velocity field stale (or the reverse) drifts
         # apart here. Requires a sustained streak so a single AUTO turn or a
         # coarse fix doesn't trip it. Skip when the track speed is itself
@@ -360,9 +360,9 @@ class Guardian:
             else:
                 self._vel_bad[sysid] = 0  # agreement resets the streak
 
-        # GPS_SPOOF: the drone's reported heading should roughly agree with
+        # GPS_ATTACK: the drone's reported heading should roughly agree with
         # the bearing implied by where its position actually moved. A GPS
-        # spoofer that injects a false position while leaving the drone's own
+        # attacker that injects a false position while leaving the drone's own
         # reported heading untouched (or vice versa) produces a sustained
         # angular disagreement that is hard to explain by normal flight.
         #
@@ -380,11 +380,11 @@ class Guardian:
             if hdg_diff > self.hdg_tol_deg:
                 self._hdg_bad[sysid] += 1
                 if self._hdg_bad[sysid] >= self.hdg_sustain:
-                    self._flag(out, sysid, "GPS_SPOOF",
+                    self._flag(out, sysid, "GPS_ATTACK",
                                f"#{sysid} heading {h1:.0f}° disagrees with "
                                f"track bearing {track_bearing:.0f}° "
                                f"({hdg_diff:.0f}° > {self.hdg_tol_deg:.0f}°) "
-                               f"— possible GPS position spoof")
+                               f"— possible GPS position attack")
             else:
                 self._hdg_bad[sysid] = 0  # agreement resets the streak
 

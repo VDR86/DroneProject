@@ -7,9 +7,9 @@ A local, self-contained UAS Traffic Management (UTM) simulation for Frisco, TX.
 Ten lightweight simulated delivery drones fly real Frisco geography and emit
 normal MAVLink telemetry over UDP; a read-only monitoring backend tracks them,
 applies flight rules, and runs a defensive (blue-team) layer that detects
-spoofed telemetry and surfaces it on a live map. Everything runs over loopback —
+attacked telemetry and surfaces it on a live map. Everything runs over loopback —
 nothing touches a real network or a real aircraft, and nothing in the project
-transmits commands or produces a spoof.
+transmits commands or produces an attack.
 
 
 WHAT EACH FILE DOES
@@ -22,24 +22,24 @@ Core system
                      (Wing 2-6, Zipline 12-16) that fly depot->delivery->depot and
                      emit standard MAVLink over UDP. Imported by the other tools.
 
-  utm_aggregator.py  The read-only monitoring backend. Binds one raw UDP socket
+  aggregator.py  The read-only monitoring backend. Binds one raw UDP socket
                      on the ingest port (raw so it can see each datagram's source,
                      which the detector needs), parses MAVLink, keeps a live
                      per-drone table, applies the flight rules, folds in the
-                     guardian's spoof alerts, and serves JSON at /api/drones and
+                     guardian's attack alerts, and serves JSON at /api/drones and
                      the map at / on port 8000. Listens only; never commands.
 
-  utm_map.html       The dashboard. A NOMINAL / ADVISORY / SECURITY condition
-                     drives the look; a Security panel lists spoofed aircraft and
-                     which detectors fired; spoofed drones get a magenta
+  map.html       The dashboard. A NOMINAL / ADVISORY / SECURITY condition
+                     drives the look; a Security panel lists attacked aircraft and
+                     which detectors fired; attacked drones get a magenta
                      target-lock, flight-rule alerts get an amber ping. Hover a
                      drone to see a dashed line to its current destination.
                      Auto-opens utm_compare.html in a second tab when a drone
-                     is flagged spoofed.
+                     is flagged attacked.
 
 
 Defensive layer
-  utm_guardian.py    The spoof detector. Decoupled from pymavlink and the fleet
+  utm_guardian.py    The attack detector. Decoupled from pymavlink and the fleet
                      so it can be unit-tested with plain Python values. Flags seven
                      things: GHOST_ID (unknown id), SRC_CONFLICT (one id, two
                      sources), TELEPORT (impossible jump), CLIMB_RATE (impossible
@@ -71,9 +71,9 @@ THE MAIN RUN (the normal system)
 Two terminals, same folder:
 
     Terminal 1:  python3 run.py fleet       (or: python3 frisco_fleet.py)
-    Terminal 2:  python3 run.py monitor     (or: python3 utm_aggregator.py)
+    Terminal 2:  python3 run.py monitor     (or: python3 aggregator.py)
 
-Then open http://localhost:8000/ in a browser. Do NOT open utm_map.html as a
+Then open http://localhost:8000/ in a browser. Do NOT open map.html as a
 file:// path — the aggregator has to serve it over HTTP. A clean run shows ten
 moving drones, condition NOMINAL, and an empty Security panel. Raw API is at
 http://localhost:8000/api/drones. Ctrl+C in each terminal to stop.
@@ -87,8 +87,8 @@ Running the launcher with no arguments opens TWO separate terminal windows —
 one for the fleet, one for a second process of your choice — and opens the
 dashboard for you. It'll prompt:
 
-    1) Normal    — fleet + utm_aggregator.py   (live telemetry, clean by default)
-    2) Spoofed   — fleet + ui_selftest.py      (scripted canned attack feed)
+    1) Normal    — fleet + aggregator.py   (live telemetry, clean by default)
+    2) Attacked   — fleet + ui_selftest.py      (scripted canned attack feed)
 
 Mode 2 gives ui_selftest.py its own terminal window on purpose: it reads
 Enter/a/c/auto/q from the keyboard to drive the staged attack, so it needs a
@@ -99,7 +99,7 @@ alongside it.
 Skip the prompt by naming the mode directly:
 
     python3 run.py normal      Same as choosing option 1
-    python3 run.py spoofed     Same as choosing option 2
+    python3 run.py attacked     Same as choosing option 2
 
 Each window runs independently once opened — run.py hands them off and
 exits. Stop a process with Ctrl+C in its window, or just close the window.
@@ -107,7 +107,7 @@ On macOS this uses Terminal.app; on Linux it tries x-terminal-emulator,
 gnome-terminal, konsole, xfce4-terminal, then xterm (whichever is
 installed); on Windows it opens a new cmd window. If none of those is
 available, it falls back to a plain background process instead (no window,
-no keyboard input — fine for utm_aggregator.py, not usable for
+no keyboard input — fine for aggregator.py, not usable for
 ui_selftest.py's staged-attack prompts).
 
 
@@ -147,7 +147,7 @@ TROUBLESHOOTING
 - "cannot bind UDP 14570" / port in use: another process already holds the
   ingest port. Stop it and retry.
 - Map won't load: open http://localhost:8000/, not the HTML file directly, and
-  keep utm_map.html in the same folder as the server that's running.
+  keep map.html in the same folder as the server that's running.
 - ModuleNotFoundError: pymavlink: activate the venv and pip install pymavlink.
 - No drones on the map: confirm the fleet is running in its own terminal.
 - Security panel never lights up: type 'a' in the selftest window; it starts
@@ -170,13 +170,7 @@ import webbrowser
 # command -> (module to import + call .main() on, one-line help)
 COMMANDS = {
     "fleet":    ("frisco_fleet",   "Launch the 10 lightweight simulated drones"),
-    "monitor":  ("utm_aggregator", "Read-only monitor + dashboard on :8000"),
-    "test":     ("test_guardian",  "Guardian unit tests, no network (expect 8/8)"),
-    "selftest": ("ui_selftest",    "Serve the dashboard with a scripted canned feed"),
-}
-COMMANDS = {
-    "fleet":    ("frisco_fleet",   "Launch the 10 lightweight simulated drones"),
-    "monitor":  ("utm_aggregator", "Read-only monitor + dashboard on :8000"),
+    "monitor":  ("aggregator",     "Read-only monitor + dashboard on :8000"),
     "test":     ("test_guardian",  "Guardian unit tests, no network (expect 8/8)"),
     "selftest": ("ui_selftest",    "Serve the dashboard with a scripted canned feed"),
     "tap":      ("ingest_tap",     "Passive read-only listener on the ingest port"),
@@ -184,10 +178,11 @@ COMMANDS = {
 
 # the two "fleet + X" pairings offered by the no-arg launcher
 UP_MODES = {
-    "1": ("monitor",  "Normal",  "fleet + utm_aggregator.py (live telemetry)"),
-    "2": ("selftest", "Compromised", "fleet + ui_selftest.py (scripted canned attack feed)"),
+    "1": ("monitor",  "Normal",   "fleet + aggregator.py (live telemetry)"),
+    "2": ("selftest", "Attacked", "fleet + ui_selftest.py (scripted canned attack feed)"),
 }
-UP_MODE_ALIASES = {"normal": "monitor", "compromised": "selftest"}
+UP_MODE_ALIASES = {"normal": "monitor", "attacked": "selftest",
+                   "compromised": "selftest"}
 
 
 def _usage(msg=None):
@@ -198,7 +193,7 @@ def _usage(msg=None):
     print("    python3 run.py            Prompt, then open fleet + monitor (or fleet\n"
           "                              + selftest) each in its own terminal window")
     print("    python3 run.py normal     Skip the prompt: fleet + monitor, separate windows")
-    print("    python3 run.py spoofed    Skip the prompt: fleet + selftest, separate windows")
+    print("    python3 run.py attacked    Skip the prompt: fleet + selftest, separate windows")
     for name, (_mod, help_text) in COMMANDS.items():
         print(f"    python3 run.py {name:<9} {help_text}")
     print("    python3 run.py check      Offline checks: unit tests + imports + ports")
@@ -237,10 +232,6 @@ def _check_ports(indent="        "):
     return ok
 
 
-
-
-
-
 def _smoketest():
     """End-to-end check: launch the REAL fleet + monitor as subprocesses,
     hit the live API, and assert a clean baseline -- 10/10 drones active,
@@ -257,7 +248,7 @@ def _smoketest():
         [sys.executable, os.path.join(here, "frisco_fleet.py")],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     mon_p = subprocess.Popen(
-        [sys.executable, os.path.join(here, "utm_aggregator.py")],
+        [sys.executable, os.path.join(here, "aggregator.py")],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     ok = True
@@ -297,6 +288,45 @@ def _smoketest():
                 p.kill()
         print("[smoketest] fleet + aggregator stopped.")
     return ok
+
+
+def _check():
+    """Offline checks: every command module imports cleanly, and both ports
+    are free. No network traffic and nothing is launched — just a quick sanity
+    pass. Returns True only if every module imports and every port is free."""
+    ok = True
+    print("[check] module imports:")
+    for name, (modname, _help) in COMMANDS.items():
+        try:
+            importlib.import_module(modname)
+            print(f"  OK   {name:<9} -> {modname}")
+        except Exception as e:  # noqa: BLE001 - report, don't abort the loop
+            print(f"  FAIL {name:<9} -> {modname}: {e}")
+            ok = False
+    print("[check] ports:")
+    ok = _check_ports() and ok
+    return ok
+
+
+def _run_guardian_tests():
+    """Run the guardian's own unit-test module (test_guardian.py) if present.
+    Kept separate from `check` because it needs that file, which is not part
+    of the core system. Degrades to a clear message rather than crashing when
+    it's absent."""
+    try:
+        tg = importlib.import_module("test_guardian")
+    except ModuleNotFoundError:
+        print("[test] test_guardian.py isn't in this folder — nothing to run.")
+        print("[test] (try 'python3 run.py smoketest' for an end-to-end check.)")
+        return False
+    entry = getattr(tg, "main", None) or getattr(tg, "run", None)
+    if entry is None:
+        print("[test] test_guardian.py has no main()/run() entry point to call.")
+        return False
+    result = entry()
+    # A test module may signal pass/fail via return value or just via its exit;
+    # treat "no explicit return" (None) as success.
+    return result is None or bool(result)
 
 
 def _terminal_launch_cmd(title, script_path, cwd):
@@ -343,7 +373,7 @@ def _terminal_launch_cmd(title, script_path, cwd):
 def _launch_in_terminal(title, script_name):
     """Start script_name in its own terminal window if possible, otherwise
     fall back to a plain background subprocess (with a warning, since that
-    means no visible window and no stdin — fine for utm_aggregator.py, not
+    means no visible window and no stdin — fine for aggregator.py, not
     fine for ui_selftest.py which needs keystrokes)."""
     here = os.path.dirname(os.path.abspath(__file__))
     script_path = os.path.join(here, script_name)
@@ -378,7 +408,7 @@ def _prompt_up_mode():
 def _up(mode=None):
     """Launch the fleet plus a second process, each in its OWN terminal
     window, and open the dashboard. mode selects the second process:
-    "monitor" (utm_aggregator.py, the normal live system) or "selftest"
+    "monitor" (aggregator.py, the normal live system) or "selftest"
     (ui_selftest.py, the scripted canned attack feed — needs its own
     terminal since it reads Enter/a/c/auto/q from the keyboard). If mode is
     not given, prompts interactively.
@@ -448,6 +478,12 @@ def main():
     if cmd == "smoketest":
         sys.exit(0 if _smoketest() else 1)
 
+    # The documented up-mode subcommands (normal / attacked) open the fleet +
+    # a second process, each in its own terminal — same as `python3 run.py`
+    # then choosing 1 or 2.
+    if cmd in UP_MODE_ALIASES:
+        sys.exit(_up(UP_MODE_ALIASES[cmd]))
+
     if cmd not in COMMANDS:
         _usage(f"unknown command '{cmd}'")
         sys.exit(1)
@@ -459,11 +495,16 @@ def main():
         if "pymavlink" in str(e):
             print("[run] ModuleNotFoundError: pymavlink — activate the venv and "
                   "run: pip install pymavlink")
-            sys.exit(1)
-        raise
-    # Reset argv to just the script name so a module with its own argparse
-    # (DroneSpam.py) sees no leftover tokens from run.py's own command line
-    # and falls back to its defaults, rather than tripping over e.g. "spam".
+        elif e.name == modname:
+            # The command's own module file isn't in this folder (e.g. `tap`
+            # needs ingest_tap.py). Report it cleanly instead of a traceback.
+            print(f"[run] '{cmd}' needs {modname}.py, which isn't in this folder.")
+        else:
+            raise
+        sys.exit(1)
+    # Reset argv to just the script name so a launched module with its own
+    # argparse sees no leftover tokens from run.py's command line and falls
+    # back to its defaults.
     sys.argv = [sys.argv[0]]
     mod.main()
 

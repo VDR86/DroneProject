@@ -1,0 +1,993 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Frisco UTM — Airspace Surveillance</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#070b10; --panel:#0b1118; --panel-2:#111b25;
+    --line:#1b2733; --text:#dfe8f0; --muted:#7d8b9a; --faint:#4a5866;
+    --instr:#3fd0c9;   /* instrument cyan — system nominal / live        */
+    --advisory:#f2b134;/* amber — flight-rule advisory (altitude/nofly)  */
+    --attack:#ff2e7e;   /* hot magenta — security / spoofed telemetry     */
+    --ok:#46d17f;      /* delivered / cleared                            */
+    --disp:'Chakra Petch',system-ui,sans-serif;
+    --data:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:var(--bg); color:var(--text);
+    font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+    overflow:hidden;
+  }
+  .data{font-family:var(--data)}
+
+  #map{position:absolute; inset:0 0 0 340px; background:var(--bg)}
+
+  /* ============ side console ============ */
+  #panel{
+    position:absolute; top:0; left:0; bottom:0; width:340px;
+    background:linear-gradient(180deg,var(--panel),#080d13);
+    border-right:1px solid var(--line);
+    display:flex; flex-direction:column; z-index:1000;
+    transition:box-shadow .5s ease, border-color .5s ease;
+  }
+  /* under attack the whole rail glows magenta */
+  body.cond-security #panel{
+    border-right-color:var(--attack);
+    box-shadow:2px 0 26px -4px rgba(255,46,126,.55);
+  }
+
+  /* pinned top: title + condition + stat tiles — never scroll away */
+  #panel-top{ flex-shrink:0 }
+
+  /* everything below the pinned header scrolls as one column */
+  #panel-body{
+    flex:1; overflow-y:auto; padding-bottom:24px;
+    scrollbar-width:thin; scrollbar-color:var(--line) transparent;
+  }
+  #panel-body::-webkit-scrollbar{width:8px}
+  #panel-body::-webkit-scrollbar-thumb{background:var(--line); border-radius:4px}
+
+  .head{padding:18px 18px 15px; border-bottom:1px solid var(--line)}
+  .title{font-family:var(--disp); font-size:21px; font-weight:700; letter-spacing:2px}
+  .title .fx{color:var(--instr)}
+  .sub{font-size:10px; color:var(--muted); text-transform:uppercase;
+    letter-spacing:3px; margin-top:3px}
+  .live{display:flex; align-items:center; gap:7px; margin-top:12px;
+    font-size:11px; color:var(--muted); font-family:var(--data)}
+  .dot{width:8px; height:8px; border-radius:50%; background:var(--instr);
+    box-shadow:0 0 9px var(--instr)}
+  .dot.pulse{animation:pulse 1.7s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+
+  /* ---- CONDITION strip: the signature element ---- */
+  #condition{
+    position:relative; overflow:hidden; min-height:26px;
+    padding:13px 18px; border-bottom:1px solid var(--line);
+    display:flex; align-items:center; gap:10px;
+    background:var(--panel-2);
+  }
+  #condition .lead{font-size:9px; letter-spacing:2px; color:var(--faint);
+    text-transform:uppercase; font-family:var(--data)}
+  #cond-word{font-family:var(--disp); font-weight:700; font-size:20px;
+    line-height:1.3; letter-spacing:2px; color:var(--instr)}
+  #cond-note{margin-left:auto; font-size:10px; color:var(--muted);
+    font-family:var(--data); text-align:right; max-width:150px}
+  body.cond-advisory #cond-word{color:var(--advisory)}
+  body.cond-security #cond-word{color:var(--attack)}
+  /* scanning sweep only while under security condition */
+  #condition::after{content:""; position:absolute; inset:0; opacity:0;
+    background:linear-gradient(90deg,transparent,rgba(255,46,126,.16),transparent);
+    transform:translateX(-100%);}
+  body.cond-security #condition::after{opacity:1; animation:sweep 2.4s linear infinite}
+  @keyframes sweep{to{transform:translateX(100%)}}
+
+  /* ---- stat tiles ---- */
+  .totals{display:flex; gap:9px; padding:14px 18px; border-bottom:1px solid var(--line)}
+  .stat{flex:1; background:var(--panel-2); border:1px solid var(--line);
+    border-radius:9px; padding:10px 11px}
+  .stat .n{font-size:23px; font-weight:600; font-family:var(--data);
+    line-height:1; color:var(--instr)}
+  .stat .l{font-size:9px; color:var(--muted); text-transform:uppercase;
+    letter-spacing:1.5px; margin-top:6px}
+
+  /* ---- generic section frame ---- */
+  .sec{border-bottom:1px solid var(--line); padding:13px 18px}
+  .sec-head{font-size:10px; letter-spacing:2px; color:var(--muted);
+    text-transform:uppercase; font-family:var(--data);
+    display:flex; align-items:center; gap:8px; margin-bottom:9px}
+  .pill{min-width:20px; height:18px; border-radius:9px; padding:0 6px;
+    background:var(--panel-2); color:var(--muted);
+    font:600 11px var(--data); display:inline-flex; align-items:center; justify-content:center}
+  .pill.on{color:#fff}
+
+  /* ---- SECURITY section ---- */
+  #security{transition:background .4s ease, border-color .4s ease}
+  body.cond-security #security{
+    background:linear-gradient(180deg,rgba(255,46,126,.09),transparent 70%);
+    border-left:2px solid var(--attack);
+  }
+  #security .sec-head{color:var(--attack)}
+  #security .pill.on{background:var(--attack)}
+  .sec-ok{font-size:11px; color:var(--muted); font-family:var(--data);
+    display:flex; align-items:center; gap:7px}
+  .sec-ok .tick{color:var(--ok)}
+  .chips{display:flex; flex-wrap:wrap; gap:5px; margin-bottom:9px}
+  .chip{font:600 10px var(--data); color:var(--attack);
+    border:1px solid rgba(255,46,126,.4); background:rgba(255,46,126,.08);
+    border-radius:5px; padding:3px 7px; letter-spacing:.5px}
+  .chip .x{color:var(--muted); font-weight:400}
+  .threat{display:grid; grid-template-columns:auto 1fr; gap:9px;
+    align-items:start; padding:5px 0; border-top:1px solid rgba(255,46,126,.12)}
+  .threat:first-of-type{border-top:none}
+  .threat .who{font:600 12px var(--data); color:var(--attack); white-space:nowrap}
+  .threat .what{font-size:11px; color:#ffb3cf; line-height:1.45}
+  .intru-log{margin-top:9px; border-top:1px dashed rgba(255,46,126,.2); padding-top:7px;
+    display:flex; flex-direction:column; gap:5px}
+  .intru{font:400 10px var(--data); line-height:1.5}
+  .intru-who{font-weight:600; white-space:nowrap}
+  .intru-body{color:inherit; opacity:.85}
+  .intru-enter{color:#ff8fb5}
+  .intru-clear{color:var(--ok)}
+  .intru .t{color:var(--faint); white-space:nowrap}
+
+  /* ---- flight ALERTS section ---- */
+  #alerts .sec-head{color:var(--advisory)}
+  #alerts .pill.on{background:var(--advisory); color:#1a1206}
+  .al-none{font-size:11px; color:var(--muted); font-family:var(--data); opacity:.7}
+  .al-row{display:grid; grid-template-columns:9px 34px 1fr; gap:8px;
+    align-items:center; padding:4px 0; font-size:12px}
+  .al-row .sd{width:8px; height:8px; border-radius:50%}
+  .al-row .id{color:var(--muted); font-family:var(--data)}
+  .al-row .msg{color:var(--advisory)}
+  .al-log{margin-top:9px; border-top:1px dashed var(--line); padding-top:7px;
+    display:flex; flex-direction:column; gap:3px}
+  .ev{font:400 10px var(--data); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .ev-enter{color:var(--advisory)}
+  .ev-clear{color:var(--ok)}
+  .ev .t{color:var(--faint)}
+
+  /* ---- fleet roster ---- */
+  .fleets{padding:6px 0}
+  .co{padding:12px 18px 6px; display:flex; align-items:center; gap:8px}
+  .co .swatch{width:10px; height:10px; border-radius:2px}
+  .co .name{font-weight:600; font-size:13px}
+  .co .ct{margin-left:auto; font-size:10px; color:var(--muted);
+    font-family:var(--data); text-transform:uppercase; letter-spacing:1px}
+  .row{display:grid; grid-template-columns:14px 40px 1fr auto; gap:8px;
+    align-items:start; padding:5px 18px; font-size:12px}
+  .row .sd{width:8px; height:8px; border-radius:50%; margin-top:3px}
+  .row.attack .sd{background:var(--attack)!important; box-shadow:0 0 7px var(--attack)}
+  .row.attack .id{color:var(--attack)}
+  .row .id{color:var(--muted); font-family:var(--data); padding-top:1px}
+  .row .val{font-family:var(--data); line-height:1.6}
+  .row .rd{color:var(--muted); font-size:11px; text-align:right; font-family:var(--data); padding-top:1px}
+  .row.stale{opacity:.4}
+
+  .legend{border-top:1px solid var(--line); padding:11px 18px; font-size:10px;
+    color:var(--muted); font-family:var(--data)}
+  .legend div{display:flex; align-items:center; gap:8px; margin:4px 0}
+  .legend .k{width:14px; text-align:center}
+
+  .compare-link{font-size:10px; color:var(--instr); text-decoration:none;
+    border-bottom:1px dotted var(--instr); white-space:nowrap}
+  .compare-link:hover{opacity:.75}
+
+  /* dark tooltip to match the UI theme */
+  .leaflet-tooltip{
+    background:var(--panel); border:1px solid var(--line);
+    border-radius:6px; color:var(--text);
+    font-family:var(--data); font-size:11px; line-height:1.6;
+    padding:7px 10px; box-shadow:0 4px 16px rgba(0,0,0,.6);
+    pointer-events:none;
+  }
+  .leaflet-tooltip::before{ border-top-color:var(--line) !important; }
+
+/* ============ SECURITY TOAST — small corner alert, swipe/tap to dismiss ============
+     Replaces the old full-screen "HACKED" takeover. This never covers the map or
+     the sidebar — it just sits in the bottom-right corner. Deliberately styled
+     like the rest of the console (same panel gradient, same border/radius as
+     .stat and .sec) rather than a one-off alert-box look, so SECURITY condition
+     doesn't change the overall feel of the dashboard — it just adds this card. */
+  #sec-toast{
+    position:fixed; right:18px; bottom:18px; z-index:2000;
+    width:316px; max-width:calc(100vw - 36px);
+    background:linear-gradient(180deg,var(--panel),#080d13);
+    border:1px solid var(--line); border-left:2px solid var(--attack);
+    border-radius:9px;
+    box-shadow:0 14px 34px -12px rgba(0,0,0,.6);
+    overflow:hidden;
+    display:none; flex-direction:column;
+    transition:transform .25s ease, opacity .25s ease; touch-action:pan-y;
+  }
+  #sec-toast.show{ display:flex; animation:toast-in .3s cubic-bezier(.2,.8,.3,1); }
+  #sec-toast.dragging{ transition:none; }         /* no easing while finger is moving it */
+  @keyframes toast-in{ from{transform:translateY(18px) scale(.97); opacity:0} to{transform:translateY(0) scale(1); opacity:1} }
+  #sec-toast .body{ padding:13px 14px; display:flex; flex-direction:column; gap:9px; }
+  #sec-toast .row1{ display:flex; align-items:center; gap:8px; }
+  #sec-toast .icon{ color:var(--attack); font-size:13px; flex-shrink:0; }
+  #sec-toast .title{ font-size:10px; letter-spacing:2px; color:var(--attack);
+    text-transform:uppercase; font-family:var(--data); font-weight:600; flex:1; }
+  #sec-toast .close{
+    cursor:pointer; color:var(--muted); font:600 12px var(--data); line-height:1;
+    width:20px; height:20px; border-radius:50%; display:flex; flex-shrink:0;
+    align-items:center; justify-content:center; transition:background .15s ease, color .15s ease;
+  }
+  #sec-toast .close:hover{ background:rgba(255,46,126,.15); color:var(--attack); }
+  #sec-toast .count{ font-family:var(--data); font-size:11px; color:var(--muted); }
+  #sec-toast .threats{
+    display:flex; flex-direction:column; gap:1px;
+    max-height:132px; overflow-y:auto;             /* scrolls instead of growing huge */
+    border-top:1px solid var(--line);
+  }
+  #sec-toast .threats::-webkit-scrollbar{ width:6px; }
+  #sec-toast .threats::-webkit-scrollbar-thumb{ background:var(--line); border-radius:3px; }
+  #sec-toast .threat-item{ display:grid; grid-template-columns:9px 1fr; gap:8px;
+    align-items:baseline; padding:7px 2px; border-bottom:1px solid rgba(255,46,126,.1); }
+  #sec-toast .threat-item:last-child{ border-bottom:none; }
+  #sec-toast .threat-item .sw{ width:8px; height:8px; border-radius:50%; align-self:center; }
+  #sec-toast .threat-item .lbl{ display:flex; flex-direction:column; gap:1px; min-width:0; }
+  #sec-toast .threat-item .who{ font:700 11px var(--data); color:var(--text); }
+  #sec-toast .threat-item .who .co{ color:var(--muted); font-weight:500; }
+  #sec-toast .threat-item .what{ font:400 10px var(--data); color:#ffb3cf; line-height:1.4; }
+  #sec-toast .hint{ font-size:9px; color:var(--faint); text-align:center;
+    padding-top:8px; margin-top:2px; border-top:1px dashed rgba(255,255,255,.07); }
+  @media (prefers-reduced-motion: reduce){ #sec-toast.show{ animation:none } }
+
+/* ============ SECURITY TOAST — small corner alert, swipe/tap to dismiss ============ */
+  #sec-reopen{
+    position:fixed; right:18px; bottom:18px; z-index:1999;
+    display:none; align-items:center; gap:7px; cursor:pointer;
+    background:linear-gradient(180deg,var(--panel),#080d13);
+    border:1px solid var(--line); border-left:2px solid var(--attack);
+    border-radius:20px; padding:9px 14px;
+    font:600 10px var(--data); letter-spacing:1px; color:var(--attack);
+    box-shadow:0 10px 26px -10px rgba(0,0,0,.6);
+    transition:transform .15s ease, box-shadow .15s ease;
+  }
+  #sec-reopen:hover{ transform:translateY(-1px); box-shadow:0 12px 30px -10px rgba(0,0,0,.7); }
+  #sec-reopen.show{ display:flex; animation:toast-in .25s ease; }
+  #sec-reopen .dot{ width:7px; height:7px; border-radius:50%; background:var(--attack);
+    box-shadow:0 0 7px var(--attack); flex-shrink:0; animation:pulse 1.7s infinite; }
+
+  /* ============ map markers ============ */
+  .drone-icon{background:none; border:none}
+  .drone{position:relative; width:30px; height:30px}
+  .drone .arrow{
+    position:absolute; left:50%; top:50%; width:0; height:0;
+    border-left:7px solid transparent; border-right:7px solid transparent;
+    border-bottom:15px solid var(--c);
+    transform-origin:50% 70%; translate:-50% -65%;
+    filter:drop-shadow(0 0 4px var(--c));
+  }
+  .drone.stale .arrow{filter:none; opacity:.5}
+  .drone.ring::before{
+    content:""; position:absolute; left:50%; top:50%;
+    width:26px; height:26px; margin:-13px 0 0 -13px;
+    border:1.5px solid var(--c); border-radius:50%; opacity:.7;
+  }
+  .drone .tag{
+    position:absolute; left:19px; top:16px;
+    font:600 10px var(--data); color:var(--text);
+    text-shadow:0 0 3px #000,0 0 3px #000; white-space:nowrap;
+  }
+  .drone.alert::after{
+    content:""; position:absolute; left:50%; top:50%;
+    width:30px; height:30px; margin:-15px 0 0 -15px; border-radius:50%;
+    border:2px solid var(--advisory); animation:ping 1.3s ease-out infinite;
+  }
+  @keyframes ping{0%{transform:scale(.55);opacity:.9}100%{transform:scale(2.3);opacity:0}}
+  .drone.attack .tag{color:var(--attack)}
+  .drone.attack .arrow{filter:drop-shadow(0 0 5px var(--attack))}
+  .drone.attack::before{
+    content:""; position:absolute; left:50%; top:50%;
+    width:32px; height:32px; margin:-16px 0 0 -16px; border-radius:50%;
+    border:1.5px dashed var(--attack); animation:lock 3s linear infinite;
+  }
+  .drone.attack::after{
+    content:""; position:absolute; left:50%; top:50%;
+    width:22px; height:22px; margin:-11px 0 0 -11px; border-radius:50%;
+    border:2px solid var(--attack); box-shadow:0 0 10px var(--attack);
+    animation:hazard 1.1s ease-in-out infinite;
+  }
+  @keyframes lock{to{transform:rotate(360deg)}}
+  @keyframes hazard{0%,100%{opacity:.35;transform:scale(.9)}50%{opacity:1;transform:scale(1.15)}}
+
+  /* true_pos: the real aircraft position during GPS spoofing.
+     Orange arrow, no animation rings — it IS the ground truth, not an anomaly.
+     Dashed ring to distinguish it from a normal drone at a glance. */
+  .drone.true-pos .arrow{
+    border-bottom-color: #ff6600;
+    filter: drop-shadow(0 0 5px #ff6600);
+  }
+  .drone.true-pos::before{
+    content:""; position:absolute; left:50%; top:50%;
+    width:28px; height:28px; margin:-14px 0 0 -14px; border-radius:50%;
+    border:1.5px dashed #ff6600; opacity:.75;
+  }
+  .drone.true-pos .tag{ color:#ff6600; }
+
+  /* abbreviated alert badges shown directly on the drone marker */
+  .drone .badges{
+    position:absolute; left:50%; top:26px;
+    transform:translateX(-50%);
+    display:flex; flex-direction:column; align-items:center; gap:2px;
+    pointer-events:none;
+  }
+  .badge{
+    font:700 8px var(--data); letter-spacing:.5px;
+    padding:1px 4px; border-radius:3px; white-space:nowrap;
+    line-height:1.4;
+  }
+  .badge-attack{ background:rgba(255,46,126,.85); color:#fff; }
+  .badge-alert{ background:rgba(242,177,52,.85); color:#1a1206; }
+
+  .deliv-badge{font:700 11px system-ui; color:var(--ok); white-space:nowrap;
+    text-shadow:0 0 6px #000,0 0 6px #000; animation:deliv 3s ease-out forwards}
+  @keyframes deliv{
+    0%{opacity:0; transform:translateY(5px) scale(.9)}
+    15%{opacity:1; transform:translateY(0) scale(1)}
+    70%{opacity:1; transform:translateY(-7px)}
+    100%{opacity:0; transform:translateY(-18px)}
+  }
+  .depot{width:14px; height:14px; transform:rotate(45deg);
+    border:2px solid var(--c); background:rgba(0,0,0,.4)}
+  .maplabel{font:600 11px var(--data); text-shadow:0 0 5px #000,0 0 5px #000;
+    white-space:nowrap; box-sizing:border-box}
+  .maplabel.ao{font-weight:700; letter-spacing:1px; opacity:.92}
+  .maplabel.nfz{color:#ff8a8a; font-size:10px}
+  @media (prefers-reduced-motion: reduce){
+    .dot.pulse,.drone.alert::after,.drone.attack::before,.drone.attack::after,
+    #condition::after{animation:none}
+  }
+</style>
+</head>
+<body>
+  <div id="panel">
+    <div id="panel-top">
+      <div class="head">
+        <div class="title">FRISCO<span class="fx">·</span>UTM</div>
+        <div class="sub">Airspace Surveillance</div>
+        <div class="live"><span class="dot pulse"></span><span id="status">connecting…</span></div>
+      </div>
+
+      <div id="condition">
+        <span class="lead">Condition</span>
+        <span id="cond-word">—</span>
+        <span id="cond-note"></span>
+      </div>
+
+      <div class="totals">
+        <div class="stat"><div class="n" id="t-active">0</div><div class="l">Active</div></div>
+        <div class="stat"><div class="n" id="t-total">0</div><div class="l">Tracked</div></div>
+        <div class="stat"><div class="n" id="t-deliv">0</div><div class="l">Delivered</div></div>
+      </div>
+    </div>
+
+    <div id="panel-body">
+      <div class="sec" id="security"></div>
+      <div class="sec" id="alerts"></div>
+
+      <div class="fleets" id="fleets"></div>
+
+      <div class="legend">
+        <div><span class="k">▲</span> drone (arrow = heading)</div>
+        <div><span class="k">◯</span> ringed = real autopilot (SITL)</div>
+        <div><span class="k" style="color:var(--attack)">◎</span> spoofed telemetry (target-locked)</div>
+        <div><span class="k" style="color:#ff6600">◌</span> true position (GPS spoofing victim)</div>
+        <div><span class="k">◆</span> company depot</div>
+        <div><span class="k" style="color:#ff5a5a">⛔</span> no-fly zone</div>
+        <div><span class="k" style="color:#22d3ee">┅</span> flight plan (on hover)</div>
+      </div>
+    </div>
+  </div>
+  <div id="map"></div>
+
+  <!-- Small corner alert only — never blocks the map or sidebar. -->
+  <div id="sec-toast">
+    <div class="body">
+      <div class="row1">
+        <span class="icon">⊘</span>
+        <span class="title">SECURITY ALERT</span>
+        <span class="close" id="sec-toast-close" title="Dismiss">✕</span>
+      </div>
+      <div class="count" id="sec-toast-count"></div>
+      <div class="threats" id="sec-toast-threats"></div>
+      <div class="hint">swipe or tap ✕ to dismiss — reopens as a small tab</div>
+    </div>
+  </div>
+
+  <div id="sec-reopen">
+    <span class="dot"></span>
+    <span id="sec-reopen-count"></span>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const SEC_LABEL = {
+      GHOST_ID:'Ghost aircraft (rogue node)', SRC_CONFLICT:'Source impersonation',
+      TELEPORT:'Position spoofing', CLIMB_RATE:'Telemetry falsification',
+      VEL_MISMATCH:'Velocity spoofing', FLEET_GUIDED:'Fleet hijack',
+      SRC_HANDOFF:'Session hijack', GPS_ATTACK:'GPS spoofing',
+      OUT_AO:'Outside area of ops',
+    };
+    // Short codes shown directly on the drone marker icon.
+    const BADGE_LABEL = {
+      GHOST_ID:'GHOST', SRC_CONFLICT:'IMPERSON', TELEPORT:'POS-SPOOF',
+      CLIMB_RATE:'FALSE-TLM', VEL_MISMATCH:'VEL-SPOOF', FLEET_GUIDED:'HIJACK',
+      SRC_HANDOFF:'SESS-HIJK', GPS_ATTACK:'GPS-SPOOF', OUT_AO:'OUT-AO',
+    };
+    // Short amber badge shown on the marker for a flight-rule (advisory) code.
+    // Mirrors anomalyLabel()'s vocabulary: HIGH/LOW/OUT_AO/NOFLY:<name>.
+    function FLIGHT_BADGE_LABEL(code){
+      if(code === 'HIGH')           return 'HIGH';
+      if(code === 'LOW')            return 'LOW';
+      if(code === 'OUT_AO')         return 'OUT-AO';
+      if(code.startsWith('NOFLY:')) return 'NOFLY';
+      return code;
+    }
+    const isAttackStr = s => typeof s === 'string' && s.startsWith('ATTACK');
+    const isSecCode  = c => c in SEC_LABEL;
+    const cleanAttack = s => s.replace(/^ATTACK\s*[—-]\s*/, '');
+
+    const map = L.map('map', {zoomControl:true, attributionControl:true})
+      .setView([33.150, -96.823], 12);
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+      attribution:'&copy; OpenStreetMap &copy; CARTO', subdomains:'abcd', maxZoom:19
+    }).addTo(map);
+
+    const droneMarkers = {}, trails = {}, trueTrails = {};
+    const latest = {}, latestTrue = {};
+    let hoverKey = null, planLine = null;
+    const shownDelivery = {};
+    let firstDeliveryScan = true, depotsDrawn = false, zonesDrawn = false;
+    const TRAIL_MAX = 80;
+    let lastResetToken = null;
+
+    function clearTrails(){
+      Object.keys(trails).forEach(k=>{
+        map.removeLayer(trails[k]); delete trails[k];
+      });
+      Object.keys(trueTrails).forEach(k=>{
+        map.removeLayer(trueTrails[k]); delete trueTrails[k];
+      });
+      Object.keys(droneMarkers).filter(k=>k.startsWith('true_')).forEach(k=>{
+        map.removeLayer(droneMarkers[k]); delete droneMarkers[k];
+        delete latestTrue[k];
+      });
+      hoverKey = null;
+      hidePlan();
+    }
+
+    // Dedicated pane that sits below the default overlayPane (z 400) so all
+    // trails are always rendered behind every marker.
+    map.createPane('trailPane');
+    map.getPane('trailPane').style.zIndex = 350;
+    map.getPane('trailPane').style.pointerEvents = 'none';
+
+    // planLine: shown only while hovering a drone marker, in trailPane so it
+    // sits behind markers. hoverKey is either a numeric sysid (normal drone)
+    // or a string "true_<sysid>" (true_pos ghost).
+
+    function showPlan(key){
+      // Never show a plan line for true_pos ghosts or any attacked/anomaly drone —
+      // a hacked drone's declared plan can't be trusted.
+      if(typeof key === 'string' && key.startsWith('true_')){ hidePlan(); return; }
+      const d = latest[key];
+      if(!d || d._attack){ hidePlan(); return; }
+      if(!d.plan || d.plan.length < 2){ hidePlan(); return; }
+      if(planLine){
+        planLine.setLatLngs(d.plan);
+        planLine.setStyle({color:'#ffffff'});
+      } else {
+        planLine = L.polyline(d.plan, {
+          color:'#ffffff', weight:1.5, dashArray:'4 8', opacity:.9,
+          interactive:false, pane:'trailPane',
+        }).addTo(map);
+      }
+    }
+    function hidePlan(){ if(planLine){ map.removeLayer(planLine); planLine = null; } }
+
+    let comparedIds = new Set();  // sysids already auto-opened in the /compare tab
+    function maybeAutoCompare(flaggedList){
+      const stillFlagged = new Set(flaggedList.map(d=>d.sysid));
+      [...comparedIds].forEach(sid=>{ if(!stillFlagged.has(sid)) comparedIds.delete(sid); });
+      flaggedList.forEach(d=>{
+        if(d.declared_plan && d.declared_plan.length >= 2 && !comparedIds.has(d.sysid)){
+          comparedIds.add(d.sysid);
+          try{ window.open(`/compare?sysid=${d.sysid}`, '_blank'); }catch(e){ }
+        }
+      });
+    }
+    let dismissedThreats = new Set();  // dismissed (sysid::code) threat keys
+    let currentFlaggedIds = [];
+    let currentThreatKeys = new Set();
+    const toast = document.getElementById('sec-toast');
+    const reopenChip = document.getElementById('sec-reopen');
+    const reopenCount = document.getElementById('sec-reopen-count');
+
+    function dismissToast(){
+      toast.classList.remove('show');
+      toast.style.transform = ''; toast.style.opacity = '';
+      dismissedThreats = new Set(currentThreatKeys);
+      if(currentFlaggedIds.length){
+        reopenCount.textContent = `${currentFlaggedIds.length} flagged — tap to view`;
+        reopenChip.classList.add('show');
+      }
+    }
+    function reopenToast(){
+      dismissedThreats = new Set();
+      reopenChip.classList.remove('show');
+      toast.classList.add('show');
+      toast.style.transform = ''; toast.style.opacity = '';
+    }
+    document.getElementById('sec-toast-close').addEventListener('click', dismissToast);
+    reopenChip.addEventListener('click', reopenToast);
+
+    let dragStartX = null;
+    const SWIPE_DISMISS_PX = 80;
+    toast.addEventListener('touchstart', e=>{
+      dragStartX = e.touches[0].clientX;
+      toast.classList.add('dragging');
+    }, {passive:true});
+    toast.addEventListener('touchmove', e=>{
+      if(dragStartX === null) return;
+      const dx = e.touches[0].clientX - dragStartX;
+      toast.style.transform = `translateX(${dx}px)`;
+      toast.style.opacity = String(Math.max(.2, 1 - Math.abs(dx)/220));
+    }, {passive:true});
+    toast.addEventListener('touchend', e=>{
+      toast.classList.remove('dragging');
+      const dx = (e.changedTouches[0].clientX) - dragStartX;
+      dragStartX = null;
+      if(Math.abs(dx) > SWIPE_DISMISS_PX){ dismissToast(); }
+      else { toast.style.transform = ''; toast.style.opacity = ''; }
+    });
+
+    function popDelivered(d){
+      const m = L.marker([d.lat,d.lon], {interactive:false, zIndexOffset:1000,
+        icon:L.divIcon({className:'', iconSize:[110,16], iconAnchor:[55,28],
+          html:`<div class="deliv-badge">✓ Delivered</div>`})}).addTo(map);
+      setTimeout(()=>{ map.removeLayer(m); }, 3200);
+    }
+
+    function droneIcon(d){
+      const hdg  = (d.hdg==null) ? 0 : d.hdg;
+      const ring = d.kind === 'SITL' ? 'ring' : '';
+      let attack;
+      if(d.kind === 'true_pos'){
+        attack = 'true-pos';
+      } else {
+        attack = d._attack ? 'attack' : (d.alert ? 'alert' : '');
+      }
+      const arrowColor = d.kind === 'true_pos' ? '#ff6600' : d.color;
+
+      // Marker badge strip: amber flight-rule codes only. The magenta attack
+      // "red icons" were removed from hacked drones — the rotating hacked ring
+      // already flags them, and the anomaly is named concisely in the hover.
+      let badgesHtml = '';
+      const pills = [];
+      (d.flight_codes || []).forEach(k=>
+        pills.push(`<span class="badge badge-alert">${FLIGHT_BADGE_LABEL(k)}</span>`));
+      if(pills.length){
+        badgesHtml = `<div class="badges">${pills.join('')}</div>`;
+      }
+
+      const html =
+        `<div class="drone ${d.status} ${ring} ${attack}" style="--c:${arrowColor}">
+           <div class="arrow" style="transform:rotate(${hdg}deg)"></div>
+           <div class="tag">${d.kind === 'true_pos' ? '⬡'+d.sysid : d.sysid}</div>
+           ${badgesHtml}
+         </div>`;
+      return L.divIcon({html, className:'drone-icon', iconSize:[30,30], iconAnchor:[15,15]});
+    }
+
+    function tip(d){
+      const h = d.hdg==null ? '—' : d.hdg.toFixed(0)+'°';
+      const mode = d.mode || '—';
+      const batt = (d.battery==null) ? '—' : d.battery+'%';
+      const lat = d.lat != null ? d.lat.toFixed(5) : '—';
+      const lon = d.lon != null ? d.lon.toFixed(5) : '—';
+      // Anomalies named in a few words (from the codes), no icons — hover only.
+      let secLabels = (d.codes || []).map(c => SEC_LABEL[c] || c);
+      if(!secLabels.length && (d.alerts||[]).some(isAttackStr)) secLabels = ['attacked'];
+      const flightLabels = (d.flight_codes || []).map(c => anomalyLabel(c));
+      return `<b style="color:${d.color}">${d.company} · #${d.sysid}</b><br>`
+           + `<span class="data">alt ${d.alt_m} m &nbsp; ${d.speed_ms} m/s &nbsp; ${h}</span><br>`
+           + `<span class="data">${mode} &nbsp; batt ${batt}</span><br>`
+           + `<span class="data" style="color:var(--muted)">${lat}, ${lon}</span>`
+           + (secLabels.length ? `<br><span style="color:#ff2e7e">${secLabels.join(', ')}</span>` : '')
+           + (flightLabels.length ? `<br><span style="color:#f2b134">${flightLabels.join(', ')}</span>` : '')
+           + (d.status==='stale' ? '<br><i>signal lost</i>' : '');
+    }
+
+    function textLabel(latlng, text, extraCls, color, dir){
+      const W = 150, H = 16, g = 12, v = 15;
+      let anchor, align = 'center', pad = '';
+      if(dir === 'left'){ anchor = [W, H/2]; align = 'right'; pad = `padding-right:${g}px`; }
+      else if(dir === 'right'){ anchor = [0, H/2]; align = 'left'; pad = `padding-left:${g}px`; }
+      else if(dir === 'below'){ anchor = [W/2, -v]; }
+      else if(dir === 'above'){ anchor = [W/2, H + v]; }
+      else { anchor = [W/2, H/2]; }
+      const style = `width:${W}px; text-align:${align}; ${pad}; ${color ? 'color:'+color : ''}`;
+      return L.marker(latlng, {interactive:false, icon:L.divIcon({className:'',
+        iconSize:[W,H], iconAnchor:anchor,
+        html:`<div class="maplabel ${extraCls}" style="${style}">${text}</div>`})});
+    }
+
+    function drawDepots(data){
+      data.depots.forEach(p=>{
+        L.marker([p.lat,p.lon], {interactive:false, icon:L.divIcon({className:'',
+          iconSize:[14,14], iconAnchor:[7,7],
+          html:`<div class="depot" style="--c:${p.color}"></div>`})}).addTo(map);
+        textLabel([p.lat,p.lon], `${p.company} depot`, 'depot', p.color, 'below').addTo(map);
+      });
+    }
+
+    function drawZones(data){
+      (data.areas||[]).forEach(a=>{
+        L.polygon(a.polygon, {color:a.color, weight:2, dashArray:'6 7',
+          fill:false, interactive:false, pane:'trailPane'}).addTo(map);
+        textLabel(a.label, `${a.company.toUpperCase()} AO`, 'ao', a.color, a.label_dir).addTo(map);
+      });
+      (data.nofly||[]).forEach(z=>{
+        L.circle([z.lat,z.lon], {radius:z.radius_m, color:'#ff5a5a', weight:1.5,
+          fillColor:'#ff5a5a', fillOpacity:0.12, interactive:false, pane:'trailPane'}).addTo(map);
+        textLabel([z.lat,z.lon], `⛔ ${z.name}`, 'nfz', null, 'center').addTo(map);
+      });
+    }
+
+    function updateDrones(data){
+      if(!zonesDrawn && data.areas){ drawZones(data); zonesDrawn = true; }
+      if(!depotsDrawn && data.depots){ drawDepots(data); depotsDrawn = true; }
+      const seen = new Set();
+      const seenTrue = new Set();
+
+      // Tag _attack on every drone object (all kinds) so updateSecurity can see them.
+      data.drones.forEach(d=>{
+        d._attack = (d.alerts||[]).some(isAttackStr);
+      });
+
+      // --- PASS 1: normal drones (not true_pos ghosts) ---
+      data.drones.filter(d => d.kind !== 'true_pos').forEach(d=>{
+        seen.add(d.sysid);
+        latest[d.sysid] = d;
+        const ll = [d.lat, d.lon];
+
+        // Trail always in trailPane, always company color (not magenta when attacked —
+        // the marker's attack ring already signals the anomaly; the trail stays legible).
+        if(!trails[d.sysid]){
+          trails[d.sysid] = L.polyline([], {
+            color: d.color, weight: 2, opacity: .45,
+            pane: 'trailPane', interactive: false,
+          }).addTo(map);
+          trails[d.sysid]._pts = [];
+        }
+        const tr = trails[d.sysid];
+        tr._pts.push(ll); if(tr._pts.length>TRAIL_MAX) tr._pts.shift();
+        tr.setLatLngs(tr._pts);
+        // Keep company color at all times; just dim slightly when stale.
+        tr.setStyle({color: d.color, opacity: d.status === 'stale' ? .2 : .45});
+
+        if(!droneMarkers[d.sysid]){
+          const key = d.sysid;
+          const mk = L.marker(ll,{icon:droneIcon(d)}).addTo(map)
+            .bindTooltip(tip(d),{direction:'top',offset:[0,-14]});
+          mk.on('mouseover', ()=>{ hoverKey = key; showPlan(key); });
+          mk.on('mouseout',  ()=>{ if(hoverKey===key){ hoverKey = null; hidePlan(); } });
+          droneMarkers[d.sysid] = mk;
+        }
+        latest[d.sysid] = d;
+        const m = droneMarkers[d.sysid];
+        m.setLatLng(ll); m.setIcon(droneIcon(d)); m.setTooltipContent(tip(d));
+      });
+
+      // --- PASS 2: true_pos ghosts (GPS attack victim's real position) ---
+      // Keyed as `true_<sysid>` so they don't clobber the attacked marker.
+      data.drones.filter(d => d.kind === 'true_pos').forEach(d=>{
+        const key = 'true_' + d.sysid;
+        seenTrue.add(key);
+        const ll = [d.lat, d.lon];
+
+        // Orange dashed trail in trailPane — visually distinct from the normal fleet.
+        if(!trueTrails[key]){
+          trueTrails[key] = L.polyline([], {
+            color: '#ff6600', weight: 2, opacity: .65,
+            dashArray: '4 7', pane: 'trailPane', interactive: false,
+          }).addTo(map);
+          trueTrails[key]._pts = [];
+        }
+        const tr = trueTrails[key];
+        tr._pts.push(ll); if(tr._pts.length>TRAIL_MAX) tr._pts.shift();
+        tr.setLatLngs(tr._pts);
+
+        if(!droneMarkers[key]){
+          droneMarkers[key] = L.marker(ll, {icon: droneIcon(d)}).addTo(map)
+            .bindTooltip(tip(d), {direction:'top', offset:[0,-14]});
+          droneMarkers[key].on('mouseover', ()=>{ hoverKey = key; showPlan(key); });
+          droneMarkers[key].on('mouseout',  ()=>{ if(hoverKey===key){ hoverKey = null; hidePlan(); } });
+        }
+        latestTrue[key] = d;
+        const m = droneMarkers[key];
+        m.setLatLng(ll); m.setIcon(droneIcon(d)); m.setTooltipContent(tip(d));
+      });
+
+      if(hoverKey !== null) showPlan(hoverKey);
+
+      // Clean up vanished normal drones.
+      Object.keys(droneMarkers).filter(k => !k.startsWith('true_')).forEach(sid=>{
+        if(!seen.has(+sid)){
+          map.removeLayer(droneMarkers[sid]); delete droneMarkers[sid];
+          if(trails[sid]){ map.removeLayer(trails[sid]); delete trails[sid]; }
+          delete latest[sid];
+          if(hoverKey === +sid){ hoverKey = null; hidePlan(); }
+        }
+      });
+      // Clean up vanished true_pos markers.
+      Object.keys(droneMarkers).filter(k => k.startsWith('true_')).forEach(key=>{
+        if(!seenTrue.has(key)){
+          map.removeLayer(droneMarkers[key]); delete droneMarkers[key];
+          if(trueTrails[key]){ map.removeLayer(trueTrails[key]); delete trueTrails[key]; }
+          delete latestTrue[key];
+          if(hoverKey === key){ hoverKey = null; hidePlan(); }
+        }
+      });
+
+      data.drones.forEach(d=>{
+        // Delivered badge is for unhacked drones only — a hijacked drone's
+        // telemetry (including any "delivered" signal) can't be trusted.
+        if(d._attack) return;
+        if(!d.delivered_ts) return;
+        if(firstDeliveryScan){ shownDelivery[d.sysid] = d.delivered_ts; return; }
+        if(shownDelivery[d.sysid] !== d.delivered_ts){
+          shownDelivery[d.sysid] = d.delivered_ts;
+          popDelivered(d);
+        }
+      });
+      firstDeliveryScan = false;
+    }
+
+    function updateCondition(data){
+      const sec = data.security || {};
+      const count = sec.flagged || 0;
+      const attacked = count > 0;
+      const advisory = (data.alerting||0) > 0;
+      const b = document.body;
+      b.classList.remove('cond-nominal','cond-advisory','cond-security');
+      const word = document.getElementById('cond-word');
+      const note = document.getElementById('cond-note');
+      const toastCount = document.getElementById('sec-toast-count');
+      const toastThreats = document.getElementById('sec-toast-threats');
+
+      if(attacked){
+        b.classList.add('cond-security'); word.textContent = 'SECURITY';
+        note.textContent = 'spoofed telemetry detected';
+        const flaggedSysids = sec.flagged_sysids || [];
+        toastCount.textContent = `${flaggedSysids.length} aircraft compromised`;
+        // Build toast from drones with codes
+        const seen = new Map();
+        data.drones.forEach(d=>{
+          if(flaggedSysids.includes(d.sysid) && (!seen.has(d.sysid)||d.kind==='sim'||d.kind==='SITL'))
+            seen.set(d.sysid, d);
+        });
+        toastThreats.innerHTML = [...seen.values()].map(d=>{
+          const badges = (d.codes||[]).map(k=>BADGE_LABEL[k]||k).join(' · ');
+          return `<div class="threat-item">`
+               + `<span class="sw" style="background:${d.color}"></span>`
+               + `<span class="lbl">`
+               +   `<span class="who">${d.company} <span class="co">#${d.sysid}</span></span>`
+               +   `<span class="what">${badges}</span>`
+               + `</span></div>`;
+        }).join('');
+        currentFlaggedIds = flaggedSysids;
+        // Track dismissal per (aircraft, threat code) — not just per aircraft —
+        // so a drone that's already been dismissed for one attack still pops
+        // the toast again if it's later flagged for a DIFFERENT code (e.g.
+        // #3 dismissed for CLIMB_RATE earlier, then later hit with
+        // FLEET_GUIDED). Keying only on sysid would silently swallow that
+        // second, distinct security event.
+        currentThreatKeys = new Set();
+        [...seen.values()].forEach(d=>{
+          (d.codes && d.codes.length ? d.codes : ['?']).forEach(code=>{
+            currentThreatKeys.add(`${d.sysid}::${code}`);
+          });
+        });
+        maybeAutoCompare([...seen.values()]);
+        const hasNewThreat = [...currentThreatKeys].some(key=>!dismissedThreats.has(key));
+        if(hasNewThreat){
+          toast.classList.add('show'); toast.style.transform=''; toast.style.opacity='';
+          reopenChip.classList.remove('show');
+        } else if(!toast.classList.contains('show')){
+          reopenCount.textContent = `${currentFlaggedIds.length} flagged — tap to view`;
+          reopenChip.classList.add('show');
+        }
+      } else if(advisory){
+        dismissedThreats = new Set();
+        currentFlaggedIds = [];
+        currentThreatKeys = new Set();
+        toast.classList.remove('show');
+        reopenChip.classList.remove('show');
+        b.classList.add('cond-advisory'); word.textContent = 'ADVISORY';
+        note.textContent = 'flight-rule breach';
+      } else {
+        b.classList.add('cond-nominal'); word.textContent = 'NOMINAL';
+        note.textContent = 'all telemetry verified';
+        dismissedThreats = new Set();
+        currentFlaggedIds = [];
+        currentThreatKeys = new Set();
+        toast.classList.remove('show');
+        reopenChip.classList.remove('show');
+      }
+    }
+
+    // Advisory amber — matches --advisory CSS var.
+    const AMBER = '#f2b134';
+
+    // A notification is a "attack" event when its text starts with "ATTACK" OR its
+    // code is a known guardian security code. Everything else (HIGH, LOW, NOFLY:*,
+    // OUT_AO from the evaluator) is a flight-rule anomaly.
+    // NOTE: we check the *text* field (not just the code) because ui_selftest
+    // prefixes all alert strings with "ATTACK — " regardless of code, while the
+    // real aggregator uses plain text for flight-rule violations. Using the text
+    // as the discriminator means both backends work correctly.
+    function isAttack(n){
+      return isSecCode(n.code) || (n.text && n.text.startsWith('ATTACK'));
+    }
+
+    function anomalyLabel(code){
+      if(code === 'HIGH')             return 'Above ceiling';
+      if(code === 'LOW')              return 'Below floor';
+      if(code === 'OUT_AO')           return 'Outside area';
+      if(code.startsWith('NOFLY:'))   return `No-fly: ${code.split(':')[1]}`;
+      return code;
+    }
+
+    function updateSecurity(data){
+      const el = document.getElementById('security');
+      const sec = data.security || {};
+      const flaggedSysids = new Set(sec.flagged_sysids || []);
+      const byCode = sec.active_by_code || {};
+      const count = sec.flagged || 0;
+
+      // Split ALL notifications into attack vs flight-rule by inspecting the text.
+      // The Security section shows ONLY the attack/security half; flight-rule
+      // anomalies live entirely in the separate Flight-alerts section.
+      const allNotifs = data.notifications || [];
+      const secNotifs   = allNotifs.filter(n => isAttack(n));
+
+      // ---- section header (security items only) ----
+      let h = `<div class="sec-head">Security<span class="pill ${count?'on':''}">${count}</span></div>`;
+
+      // Nothing security-related — show the clean state.
+      if(count === 0 && !secNotifs.length){
+        h += `<div class="sec-ok"><span class="tick">✓</span>No intrusions detected</div>`;
+        el.innerHTML = h; return;
+      }
+
+      // ======== ATTACK / SECURITY BLOCK ========
+      if(count > 0 || secNotifs.length){
+
+        // Active code chips.
+        if(Object.keys(byCode).length){
+          h += `<div class="chips">`;
+          Object.entries(byCode).forEach(([c,n])=>{
+            h += `<span class="chip">${SEC_LABEL[c]||c} <span class="x">×${n}</span></span>`;
+          });
+          h += `</div>`;
+        }
+
+        // Per-drone threat summary.
+        if(flaggedSysids.size){
+          const seen = new Map();
+          data.drones.forEach(d=>{
+            if(!flaggedSysids.has(d.sysid)) return;
+            if(!seen.has(d.sysid) || d.kind==='sim' || d.kind==='SITL') seen.set(d.sysid,d);
+          });
+          seen.forEach(d=>{
+            const codes = (d.codes||[]).map(k=>`<span style="background:rgba(255,46,126,.2);color:var(--attack);font:700 9px var(--data);padding:1px 5px;border-radius:3px;margin-left:4px">${BADGE_LABEL[k]||k}</span>`).join('');
+            h += `<div style="display:flex;align-items:center;padding:4px 0;border-top:1px solid rgba(255,46,126,.12)">`;
+            h += `<span style="font:600 12px var(--data);color:var(--attack)">${d.company} #${d.sysid}</span>${codes}`;
+            h += `</div>`;
+          });
+        }
+
+        // Attack notification log.
+        if(secNotifs.length){
+          h += `<div style="margin-top:10px;border-top:1px dashed rgba(255,46,126,.25);padding-top:8px">`;
+          secNotifs.slice(0,12).forEach(n=>{
+            const enter = n.kind==='enter';
+            const verb = enter ? '⊘' : '✓';
+            const col  = enter ? '#ff8fb5' : '#46d17f';
+            const who  = (n.company?n.company+' ':'')+'#'+n.sysid;
+            const body = enter ? cleanAttack(n.text) : (SEC_LABEL[n.code]||n.code)+' — cleared';
+            h += `<div style="margin-bottom:7px;font-family:var(--data);font-size:10px;color:${col};line-height:1.5">`;
+            h += `<div style="font-weight:600">${verb} ${who} <span style="color:var(--faint);font-weight:400">${Math.round(n.ago_s)}s ago</span></div>`;
+            h += `<div style="padding-left:10px;opacity:.85">${body}</div>`;
+            h += `</div>`;
+          });
+          h += `</div>`;
+        }
+      }
+
+      el.innerHTML = h;
+    }
+
+    function updatePanel(data){
+      document.getElementById('t-active').textContent = data.counts.active;
+      document.getElementById('t-total').textContent  = data.counts.total;
+      document.getElementById('t-deliv').textContent   = data.deliveries || 0;
+      const when = new Date(data.updated*1000).toLocaleTimeString();
+      document.getElementById('status').textContent = 'live · updated '+when;
+
+      const byCo = {};
+      data.drones.forEach(d=>{ (byCo[d.company]=byCo[d.company]||[]).push(d); });
+
+      let html = '';
+      Object.keys(data.colors).forEach(co=>{
+        const list = (byCo[co]||[]).sort((a,b)=>a.sysid-b.sysid);
+        const color = data.colors[co];
+        html += `<div class="co"><span class="swatch" style="background:${color}"></span>`
+              + `<span class="name">${co}</span><span class="ct">${list.length} aircraft</span></div>`;
+        list.forEach(d=>{
+          const live = d.status==='active';
+          const sd = live ? color : '#555';
+          const cls = (d._attack?'attack ':'') + (live?'':'stale');
+          html += `<div class="row ${cls}">`
+                + `<span class="sd" style="background:${sd}"></span>`
+                + `<span class="id">#${d.sysid}</span>`
+                + `<span class="val">${d.alt_m} m</span>`
+                + `<span class="rd">${d.speed_ms} m/s</span></div>`;
+        });
+      });
+      document.getElementById('fleets').innerHTML = html;
+    }
+
+    function updateAlerts(data){
+      const active = [];
+      data.drones.forEach(d => (d.alerts||[])
+        .filter(m=>!isAttackStr(m))
+        .forEach(m => active.push({d, m})));
+      let html = `<div class="sec-head">Flight alerts`
+               + `<span class="pill ${active.length?'on':''}">${active.length}</span></div>`;
+      if(active.length === 0){
+        html += `<div class="al-none">no active advisories</div>`;
+      } else {
+        // Show only the FIRST active flight alert (the pill still reflects the
+        // true total so the operator knows how many are in effect).
+        const a = active[0];
+        html += `<div class="al-row"><span class="sd" style="background:${a.d.color}"></span>`
+              + `<span class="id">#${a.d.sysid}</span>`
+              + `<span class="msg">${a.m}</span></div>`;
+      }
+      document.getElementById('alerts').innerHTML = html;
+    }
+
+    async function poll(){
+      try{
+        const r = await fetch('/api/drones', {cache:'no-store'});
+        const data = await r.json();
+        if(data.reset_token !== undefined && data.reset_token !== lastResetToken){
+          if(lastResetToken !== null) clearTrails();
+          lastResetToken = data.reset_token;
+        }
+        updateDrones(data);       
+        updateCondition(data);
+        updateSecurity(data);
+        updateAlerts(data);
+        updatePanel(data);
+      }catch(e){
+        document.getElementById('status').textContent = 'aggregator offline — retrying';
+      }
+    }
+    poll();
+    setInterval(poll, 1000);
+  </script>
+</body>
+</html>
