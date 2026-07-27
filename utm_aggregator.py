@@ -21,7 +21,6 @@ then open http://localhost:8000/ in the browser.
 import json
 import math
 import os
-import socket
 import threading
 import time
 from collections import deque
@@ -32,14 +31,9 @@ os.environ["MAVLINK20"] = "1"
 from pymavlink import mavutil  # noqa: E402
 
 import frisco_fleet as ff  # the scenario's single source of truth
-import utm_guardian          # spoof-resistance layer (defensive; listens only)
 
 HTTP_PORT = 8000
 STALE_S = 4.0   # no telemetry for longer than this -> mark the drone "stale"
-
-# Look for the map page next to THIS script, so it's found no matter what
-# directory the aggregator happens to be launched from.
-HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "utm_map.html")
 
 EVAL_S = 0.5              # how often the violation check runs
 DEPOT_SUPPRESS_M = 200.0  # within this range of a depot, ignore the low-alt rule
@@ -49,10 +43,6 @@ DELIVERY_RADIUS_M = 120.0 # stopped within this of a delivery point = a drop
 # Live state: sysid -> dict of latest values. Guarded by `lock`.
 state = {}
 lock = threading.Lock()
-
-# Spoof-resistance monitor. Knows which system ids are legitimately registered
-# so it can flag ghost ids; everything else it infers from the stream itself.
-guardian = utm_guardian.Guardian(ff.FLEET.keys())
 
 # Alerts (guarded by `lock`): current violations per drone, plus an edge-event feed.
 alerts_state = {}                  # sysid -> {code: message} currently active
@@ -73,86 +63,56 @@ COPTER_MODES = {
 # ---------------------------------------------------------------------------
 # INGEST: one listener hears the whole fleet by system id
 # ---------------------------------------------------------------------------
-def _handle_message(sid, mtype, msg, src, now):
-    """Update shared state (and feed the guardian) for one parsed message.
-    `src` is the datagram's (host, port) origin, used for provenance checks."""
-    if mtype == "GLOBAL_POSITION_INT":
-        company, kind = ff.FLEET.get(sid, ("Unknown", "?"))
-        speed = math.hypot(msg.vx, msg.vy) / 100.0  # vx/vy cm/s -> m/s
-        guardian.observe(sid, mtype, t=now,
-                         lat=msg.lat / 1e7, lon=msg.lon / 1e7,
-                         alt_m=round(msg.relative_alt / 1000.0, 1),
-                         speed_ms=round(speed, 1), src=src)
-        with lock:
-            d = state.setdefault(sid, {})
-            d.update(
-                sysid=sid,
-                company=company,
-                kind=kind,
-                color=ff.COMPANY_COLOR.get(company, "#888888"),
-                lat=msg.lat / 1e7,
-                lon=msg.lon / 1e7,
-                alt_m=round(msg.relative_alt / 1000.0, 1),   # above ground
-                amsl_m=round(msg.alt / 1000.0, 1),           # above sea level
-                hdg=(round(msg.hdg / 100.0, 1) if msg.hdg != 65535 else None),
-                speed_ms=round(speed, 1),
-                last_seen=now,
-            )
-    elif mtype == "VFR_HUD":
-        # Real SITL drones send this; use its groundspeed if we have a record.
-        with lock:
-            if sid in state:
-                state[sid]["speed_ms"] = round(msg.groundspeed, 1)
-    elif mtype == "HEARTBEAT":
-        # Flight mode lives in custom_mode (valid when the custom-mode flag is set).
-        if msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED:
-            mode = COPTER_MODES.get(msg.custom_mode, f"MODE{msg.custom_mode}")
-            with lock:
-                state.setdefault(sid, {})["mode"] = mode
-            guardian.observe(sid, mtype, t=now, mode=mode, src=src)
-    elif mtype == "SYS_STATUS":
-        # Battery remaining %, -1 when unknown.
-        with lock:
-            batt = msg.battery_remaining
-            state.setdefault(sid, {})["battery"] = batt if batt >= 0 else None
-
-
 def ingest(stop):
-    # Bind a raw UDP socket so every datagram's SOURCE address is available.
-    # pymavlink's udpin connection does not expose the sender on this version,
-    # and that address is exactly what the guardian's SRC_CONFLICT check needs,
-    # so we read datagrams directly and parse MAVLink from the bytes ourselves.
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    # No SO_REUSEADDR: if another process already holds this port, we WANT the
-    # bind to fail loudly here rather than silently receive nothing (on Windows
-    # SO_REUSEADDR lets a second listener start but steal or split datagrams).
-    try:
-        sock.bind(("127.0.0.1", ff.INGEST_PORT))
-    except OSError as e:
-        print(f"[utm] ERROR: cannot bind UDP {ff.INGEST_PORT} ({e}).")
-        print("[utm] Another process is already using that port — close any "
-              "other aggregator or ingest_tap and start this one again.")
-        stop.set()
-        return
-    sock.settimeout(0.5)
-    parser = mavutil.mavlink.MAVLink(None)
-    parser.robust_parsing = True   # skip malformed frames instead of raising
+    conn = mavutil.mavlink_connection(f"udpin:127.0.0.1:{ff.INGEST_PORT}")
     print(f"[utm] listening for the fleet on UDP {ff.INGEST_PORT}")
     while not stop.is_set():
-        try:
-            data, src = sock.recvfrom(65535)
-        except (socket.timeout, OSError):
+        msg = conn.recv_match(blocking=True, timeout=0.5)
+        if msg is None:
             continue
-        try:
-            msgs = parser.parse_buffer(data) or []
-        except mavutil.mavlink.MAVError:
-            msgs = []          # partial/garbled datagram; wait for the next one
-        now = time.time()
-        for msg in msgs:
-            mtype = msg.get_type()
-            if mtype == "BAD_DATA":
-                continue
-            _handle_message(msg.get_srcSystem(), mtype, msg, src, now)
+        sid = msg.get_srcSystem()
+        mtype = msg.get_type()
+
+        if mtype == "GLOBAL_POSITION_INT":
+            company, kind = ff.FLEET.get(sid, ("Unknown", "?"))
+            speed = math.hypot(msg.vx, msg.vy) / 100.0  # vx/vy cm/s -> m/s
+            with lock:
+                d = state.setdefault(sid, {})
+                d.update(
+                    sysid=sid,
+                    company=company,
+                    kind=kind,
+                    color=ff.COMPANY_COLOR.get(company, "#888888"),
+                    lat=msg.lat / 1e7,
+                    lon=msg.lon / 1e7,
+                    alt_m=round(msg.relative_alt / 1000.0, 1),   # above ground
+                    amsl_m=round(msg.alt / 1000.0, 1),           # above sea level
+                    hdg=(round(msg.hdg / 100.0, 1) if msg.hdg != 65535 else None),
+                    speed_ms=round(speed, 1),
+                    last_seen=time.time(),
+                )
+        elif mtype == "VFR_HUD":
+            # Real SITL drones send this; use its groundspeed if we have a record.
+            with lock:
+                if sid in state:
+                    state[sid]["speed_ms"] = round(msg.groundspeed, 1)
+        elif mtype == "HEARTBEAT":
+            # Flight mode lives in custom_mode (valid when the custom-mode flag is set).
+            if msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED:
+                mode = COPTER_MODES.get(msg.custom_mode, f"MODE{msg.custom_mode}")
+                with lock:
+                    state.setdefault(sid, {})["mode"] = mode
+        elif mtype == "SYS_STATUS":
+            # Battery remaining %, -1 when unknown.
+            with lock:
+                batt = msg.battery_remaining
+                state.setdefault(sid, {})["battery"] = batt if batt >= 0 else None
+        elif mtype == "POSITION_TARGET_GLOBAL_INT":
+            # Where the drone is currently headed (its active waypoint).
+            with lock:
+                if sid in state:
+                    state[sid]["tgt_lat"] = msg.lat_int / 1e7
+                    state[sid]["tgt_lon"] = msg.lon_int / 1e7
 
 
 # ---------------------------------------------------------------------------
@@ -248,12 +208,6 @@ def evaluator(stop):
 
         cur = {sid: violations(d) for sid, d in snap.items()}
 
-        # Fold in the spoof-resistance alerts. These ride the same enter/clear
-        # + map-rendering path as the rule violations, so no front-end change is
-        # needed — a flagged drone gets the same red ping.
-        for sid, sec in guardian.assess(now).items():
-            cur.setdefault(sid, {}).update(sec)
-
         # Inferred deliveries: a drone stopped near a delivery point (not a depot).
         cur_delivered = set()
         for sid, dd in snap.items():
@@ -313,6 +267,21 @@ def snapshot():
             item["alerts"] = list(a.values())
             item["alert"] = bool(a)
             item["delivered_ts"] = delivered_ts.get(d["sysid"])
+            # Flight-plan path: current position -> destination, and (for the
+            # delivery fleet) on home to the depot.
+            plan = None
+            tlat, tlon = d.get("tgt_lat"), d.get("tgt_lon")
+            if tlat is not None:
+                pos = [d["lat"], d["lon"]]
+                depot = ff.DEPOTS.get(d.get("company"))
+                if d.get("kind") == "sim" and depot:
+                    if haversine_m(tlat, tlon, depot[0], depot[1]) < 120:
+                        plan = [pos, [depot[0], depot[1]]]
+                    else:
+                        plan = [pos, [tlat, tlon], [depot[0], depot[1]]]
+                else:
+                    plan = [pos, [tlat, tlon]]
+            item["plan"] = plan
             drones.append(item)
         notif = [dict(n) for n in list(notifications)[:60]]
     drones.sort(key=lambda x: x["sysid"])
@@ -348,7 +317,6 @@ def snapshot():
         ],
         "alerting": sum(1 for d in drones if d.get("alert")),
         "deliveries": delivery_count,
-        "security": guardian.summary(now),
     }
 
 
@@ -372,14 +340,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(json.dumps(snapshot()).encode(), "application/json")
         elif self.path in ("/", "/index.html"):
             try:
-                with open(HTML_PATH, "rb") as f:
+                with open("utm_map.html", "rb") as f:
                     self._send(f.read(), "text/html; charset=utf-8")
             except FileNotFoundError:
                 self._send(
                     b"<h1>UTM aggregator is running</h1>"
                     b"<p>Live data: <a href='/api/drones'>/api/drones</a></p>"
-                    b"<p>utm_map.html was not found next to utm_aggregator.py "
-                    b"&mdash; put the two files in the same folder.</p>",
+                    b"<p>The map page (utm_map.html) isn't in this folder yet.</p>",
                     "text/html; charset=utf-8")
         else:
             self.send_response(404)
