@@ -2,10 +2,10 @@
 utm_aggregator.py
 =================
 
-The read-only MONITORING backend for the Frisco UTM. It is the de-weaponized
+The read-only MONITORING backend for the GridEye. It is the de-weaponized
 cousin of the fleet proxy: it only LISTENS. No commands, no spoofing.
 
-  * Listens on ONE UDP port (frisco_fleet.INGEST_PORT). Every drone - the 10
+  * Listens on ONE UDP port (lightweight_fleet.INGEST_PORT). Every drone - the 10
     lightweight ones and the 2 real SITL ones (fed in via MAVProxy --out) -
     arrives in this single stream, separated by MAVLink system id.
   * Keeps a live table: for each drone, its company, position, altitude, heading,
@@ -13,7 +13,7 @@ cousin of the fleet proxy: it only LISTENS. No commands, no spoofing.
   * Serves that table as JSON at  http://localhost:8000/api/drones  and serves
     the map page at  http://localhost:8000/  (once utm_map.html exists).
 
-Run AFTER starting frisco_fleet.py (and optionally the 2 SITL drones):
+Run AFTER starting lightweight_fleet.py (and optionally the 2 SITL drones):
     python3 utm_aggregator.py
 then open http://localhost:8000/ in the browser.
 """
@@ -30,7 +30,7 @@ os.environ["MAVLINK20"] = "1"
 
 from pymavlink import mavutil  # noqa: E402
 
-import frisco_fleet as ff  # the scenario's single source of truth
+import lightweight_fleet as lf  # the scenario's single source of truth
 
 HTTP_PORT = 8000
 STALE_S = 4.0   # no telemetry for longer than this -> mark the drone "stale"
@@ -64,8 +64,8 @@ COPTER_MODES = {
 # INGEST: one listener hears the whole fleet by system id
 # ---------------------------------------------------------------------------
 def ingest(stop):
-    conn = mavutil.mavlink_connection(f"udpin:127.0.0.1:{ff.INGEST_PORT}")
-    print(f"[utm] listening for the fleet on UDP {ff.INGEST_PORT}")
+    conn = mavutil.mavlink_connection(f"udpin:127.0.0.1:{lf.INGEST_PORT}")
+    print(f"[GridEye] listening for the fleet on UDP {lf.INGEST_PORT}")
     while not stop.is_set():
         msg = conn.recv_match(blocking=True, timeout=0.5)
         if msg is None:
@@ -74,7 +74,7 @@ def ingest(stop):
         mtype = msg.get_type()
 
         if mtype == "GLOBAL_POSITION_INT":
-            company, kind = ff.FLEET.get(sid, ("Unknown", "?"))
+            company, kind = lf.FLEET.get(sid, ("Unknown", "?"))
             speed = math.hypot(msg.vx, msg.vy) / 100.0  # vx/vy cm/s -> m/s
             with lock:
                 d = state.setdefault(sid, {})
@@ -82,7 +82,7 @@ def ingest(stop):
                     sysid=sid,
                     company=company,
                     kind=kind,
-                    color=ff.COMPANY_COLOR.get(company, "#888888"),
+                    color=lf.COMPANY_COLOR.get(company, "#888888"),
                     lat=msg.lat / 1e7,
                     lon=msg.lon / 1e7,
                     alt_m=round(msg.relative_alt / 1000.0, 1),   # above ground
@@ -153,25 +153,25 @@ def violations(d):
     company = d.get("company")
 
     # 1) above the 400 ft ceiling
-    if alt > ff.MAX_ALT_M:
+    if alt > lf.MAX_ALT_M:
         out["HIGH"] = f"above 400 ft ({alt:.0f} m)"
 
     # 2) below the 10 m floor — but only in transit (away from any depot)
-    if alt < ff.MIN_ALT_M:
+    if alt < lf.MIN_ALT_M:
         near_depot = any(
             haversine_m(lat, lon, dep[0], dep[1]) < DEPOT_SUPPRESS_M
-            for dep in ff.DEPOTS.values()
+            for dep in lf.DEPOTS.values()
         )
         if not near_depot:
             out["LOW"] = f"below 10 m ({alt:.0f} m)"
 
     # 3) inside a no-fly zone
-    for z in ff.NO_FLY_ZONES:
+    for z in lf.NO_FLY_ZONES:
         if haversine_m(lat, lon, z["lat"], z["lon"]) < z["radius_m"]:
             out[f"NOFLY:{z['name']}"] = f"in no-fly zone: {z['name']}"
 
     # 4) outside its company's area of operations
-    poly = ff.AREAS_OF_OPERATION.get(company)
+    poly = lf.AREAS_OF_OPERATION.get(company)
     if poly and not point_in_poly(lat, lon, poly):
         out["OUT_AO"] = f"left {company} area"
 
@@ -187,7 +187,7 @@ def _clear_label(code):
 
 
 def _emit(sid, code, text, kind):
-    company = ff.FLEET.get(sid, ("?", "?"))[0]
+    company = lf.FLEET.get(sid, ("?", "?"))[0]
     notifications.appendleft({"t": time.time(), "sysid": sid, "company": company,
                               "kind": kind, "code": code, "text": text})
 
@@ -215,9 +215,9 @@ def evaluator(stop):
                 continue
             lat, lon = dd["lat"], dd["lon"]
             near_deliv = min((haversine_m(lat, lon, p[0], p[1])
-                              for p in ff.DELIVERY_POINTS), default=1e9) < DELIVERY_RADIUS_M
+                              for p in lf.DELIVERY_POINTS), default=1e9) < DELIVERY_RADIUS_M
             near_depot = any(haversine_m(lat, lon, dep[0], dep[1]) < DEPOT_SUPPRESS_M
-                             for dep in ff.DEPOTS.values())
+                             for dep in lf.DEPOTS.values())
             if near_deliv and not near_depot:
                 cur_delivered.add(sid)
 
@@ -273,7 +273,7 @@ def snapshot():
             tlat, tlon = d.get("tgt_lat"), d.get("tgt_lon")
             if tlat is not None:
                 pos = [d["lat"], d["lon"]]
-                depot = ff.DEPOTS.get(d.get("company"))
+                depot = lf.DEPOTS.get(d.get("company"))
                 if d.get("kind") == "sim" and depot:
                     if haversine_m(tlat, tlon, depot[0], depot[1]) < 120:
                         plan = [pos, [depot[0], depot[1]]]
@@ -287,8 +287,8 @@ def snapshot():
     drones.sort(key=lambda x: x["sysid"])
 
     depots = [
-        {"company": c, "lat": ll[0], "lon": ll[1], "color": ff.COMPANY_COLOR[c]}
-        for c, ll in ff.DEPOTS.items()
+        {"company": c, "lat": ll[0], "lon": ll[1], "color": lf.COMPANY_COLOR[c]}
+        for c, ll in lf.DEPOTS.items()
     ]
     active = sum(1 for d in drones if d["status"] == "active")
     by_company = {}
@@ -296,21 +296,21 @@ def snapshot():
         by_company[d["company"]] = by_company.get(d["company"], 0) + 1
 
     areas = [
-        {"company": c, "color": ff.COMPANY_COLOR[c],
+        {"company": c, "color": lf.COMPANY_COLOR[c],
          "polygon": [[la, lo] for la, lo in poly],
-         "label": [ff.AO_LABEL[c]["lat"], ff.AO_LABEL[c]["lon"]],
-         "label_dir": ff.AO_LABEL[c]["dir"]}
-        for c, poly in ff.AREAS_OF_OPERATION.items()
+         "label": [lf.AO_LABEL[c]["lat"], lf.AO_LABEL[c]["lon"]],
+         "label_dir": lf.AO_LABEL[c]["dir"]}
+        for c, poly in lf.AREAS_OF_OPERATION.items()
     ]
 
     return {
         "updated": now,
-        "center": {"lat": ff.MAP_CENTER[0], "lon": ff.MAP_CENTER[1]},
-        "colors": ff.COMPANY_COLOR,
+        "center": {"lat": lf.MAP_CENTER[0], "lon": lf.MAP_CENTER[1]},
+        "colors": lf.COMPANY_COLOR,
         "counts": {"total": len(drones), "active": active, "by_company": by_company},
         "depots": depots,
         "areas": areas,
-        "nofly": ff.NO_FLY_ZONES,
+        "nofly": lf.NO_FLY_ZONES,
         "drones": drones,
         "notifications": [
             {**n, "ago_s": round(now - n["t"], 1)} for n in notif
@@ -344,7 +344,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(f.read(), "text/html; charset=utf-8")
             except FileNotFoundError:
                 self._send(
-                    b"<h1>UTM aggregator is running</h1>"
+                    b"<h1>GridEye aggregator is running</h1>"
                     b"<p>Live data: <a href='/api/drones'>/api/drones</a></p>"
                     b"<p>The map page (utm_map.html) isn't in this folder yet.</p>",
                     "text/html; charset=utf-8")
@@ -361,7 +361,7 @@ def reporter(stop):
         c = snap["counts"]
         alerting = snap["alerting"]
         extra = f"  ALERTS: {alerting}" if alerting else ""
-        print(f"[utm] {c['active']}/{c['total']} active  {c['by_company']}{extra}")
+        print(f"[GridEye] {c['active']}/{c['total']} active  {c['by_company']}{extra}")
 
 
 def main():
@@ -371,7 +371,7 @@ def main():
     threading.Thread(target=reporter, args=(stop,), daemon=True).start()
 
     httpd = ThreadingHTTPServer(("127.0.0.1", HTTP_PORT), Handler)
-    print(f"[utm] serving  http://localhost:{HTTP_PORT}/   (api at /api/drones)")
+    print(f"[GridEye] serving  http://localhost:{HTTP_PORT}/   (api at /api/drones)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -379,7 +379,7 @@ def main():
     finally:
         stop.set()
         httpd.shutdown()
-        print("\n[utm] stopped.")
+        print("\n[GridEye] stopped.")
 
 
 if __name__ == "__main__":
