@@ -85,7 +85,8 @@ class SimDrone(threading.Thread):
         self.rate = rate_hz
         self.stop = stop
 
-        self.start_time = time.time()
+        self.start_time = time.monotonic()
+        time_since_boot = int((time.monotonic() - self.start_time) * 1000)
 
 
     def send_heartbeat(self):
@@ -111,7 +112,7 @@ class SimDrone(threading.Thread):
         rel_alt_mm = 30000
 
         self.master.mav.global_position_int_send(
-            int(time.time() * 1000),
+            time_since_boot,
             int(lat * 1e7),
             int(lon * 1e7),
             alt_mm,
