@@ -14,9 +14,6 @@ several staged scenarios on demand, driven entirely from the terminal this
 process is running in -- there is no on-page control of any kind, so nobody
 who can merely load the dashboard in a browser can change what it's showing:
 
-It also demonstrates the attack detail tab (grideye_compare.html): a flagged
-(attacked) drone gets an "off-course ↗" link — and map.html auto-opens it
-— so you can watch its reported track plotted at /compare?sysid=N.
 
   In the terminal (the only place this is controlled from):
     Enter        toggle the current scenario's takeover on/off
