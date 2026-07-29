@@ -1,7 +1,8 @@
+"""
 aggregator.py
 =================
 
-The read-only MONITORING backend for the GridEye. It is the de-weaponized
+The read-only MONITORING backend for GridEye. It is the de-weaponized
 cousin of the fleet proxy: it only LISTENS. No commands, no attacking.
 
   * Listens on ONE UDP port (lightweight_fleet.INGEST_PORT). Every drone - the 10
@@ -10,7 +11,7 @@ cousin of the fleet proxy: it only LISTENS. No commands, no attacking.
   * Keeps a live table: for each drone, its company, position, altitude, heading,
     speed, and how long since it was last heard.
   * Serves that table as JSON at  http://localhost:8000/api/drones  and serves
-    the map page at  http://localhost:8000/  (once utm_map.html exists).
+    the map page at  http://localhost:8000/  (once map.html exists).
 
 Run AFTER starting lightweight_fleet.py (and optionally the 2 SITL drones):
     python3 aggregator.py
@@ -30,7 +31,7 @@ os.environ["MAVLINK20"] = "1"
 from pymavlink import mavutil  # noqa: E402
 
 import lightweight_fleet as lf  # the scenario's single source of truth
-from utm_guardian import Guardian  # the defensive attack-detection layer
+from grideye_guardian import Guardian  # the defensive attack-detection layer
 
 HTTP_PORT = 8000
 STALE_S = 4.0   # no telemetry for longer than this -> mark the drone "stale"
@@ -43,6 +44,11 @@ DELIVERY_RADIUS_M = 120.0 # stopped within this of a delivery point = a drop
 # Live state: sysid -> dict of latest values. Guarded by `lock`.
 state = {}
 lock = threading.Lock()
+
+# In-progress mission uploads (MISSION_COUNT..MISSION_ITEM_INT*), keyed by
+# sysid. Only touched from the single ingest thread, so no lock needed. Once
+# every item for a sysid has arrived, its route gets copied into `state`.
+mission_buffers = {}
 
 # Alerts (guarded by `lock`): current violations per drone, plus an edge-event feed.
 alerts_state = {}                  # sysid -> {code: message} currently active
@@ -66,6 +72,7 @@ security_summary = {"flagged_sysids": [], "flagged": 0, "active_by_code": {}}
 # Deliveries (guarded by `lock`).
 delivery_count = 0        # total completed deliveries since start
 delivered_ts = {}         # sysid -> epoch of that drone's most recent delivery
+delivered_n = {}          # sysid -> that drone's own completed-delivery count
 
 # ArduCopter custom_mode number -> readable name (the common ones).
 COPTER_MODES = {
@@ -80,7 +87,7 @@ COPTER_MODES = {
 # ---------------------------------------------------------------------------
 def ingest(stop):
     conn = mavutil.mavlink_connection(f"udpin:127.0.0.1:{lf.INGEST_PORT}")
-    print(f"[GridEye] listening for the fleet on UDP {lf.INGEST_PORT}")
+    print(f"[grideye] listening for the fleet on UDP {lf.INGEST_PORT}")
     while not stop.is_set():
         msg = conn.recv_match(blocking=True, timeout=0.5)
         if msg is None:
@@ -142,6 +149,31 @@ def ingest(stop):
                 if sid in state:
                     state[sid]["tgt_lat"] = msg.lat_int / 1e7
                     state[sid]["tgt_lon"] = msg.lon_int / 1e7
+        elif mtype == "MISSION_COUNT":
+            # Start of a new mission upload — the fleet sim broadcasts one of
+            # these (unsolicited, just like its other telemetry) every time a
+            # drone plots a fresh dog-legged route to its next stop.
+            mission_buffers[sid] = {"count": msg.count, "items": {}}
+        elif mtype == "MISSION_ITEM_INT":
+            buf = mission_buffers.get(sid)
+            if buf is not None:
+                buf["items"][msg.seq] = (msg.x / 1e7, msg.y / 1e7)
+                if len(buf["items"]) >= buf["count"]:
+                    route = [buf["items"][i] for i in range(buf["count"])]
+                    with lock:
+                        d = state.setdefault(sid, {})
+                        d["route"] = route
+                        d.setdefault("route_seq", 0)
+                    del mission_buffers[sid]
+        elif mtype == "MISSION_CURRENT":
+            # Which waypoint the drone is flying to right now. The fleet's
+            # tours are ~17 waypoints long, so without this the flight-plan
+            # line would be drawn from the drone's position back through every
+            # leg it had ALREADY flown — a long false loop across the map.
+            # Tracking the active sequence lets us draw only what's ahead.
+            with lock:
+                if sid in state:
+                    state[sid]["route_seq"] = int(msg.seq)
 
 
 # ---------------------------------------------------------------------------
@@ -253,18 +285,33 @@ def evaluator(stop):
                    "flagged": len(sec),
                    "active_by_code": by_code}
 
-        # Inferred deliveries: a drone stopped near a delivery point (not a depot).
+        # Inferred deliveries: a drone stopped at the END OF ITS OWN PATH — i.e.
+        # parked on the final waypoint of its route, which is its one drop-off.
+        # (Proximity to any delivery point is too loose: a wandering tour can
+        # pass near another route's drop mid-flight. The end of the path is the
+        # only place a delivery actually happens.) SITL drones that never upload
+        # a mission have no route, so they fall back to the near-any-delivery
+        # test using their reported destination.
         cur_delivered = set()
         for sid, dd in snap.items():
             if dd.get("speed_ms", 99) > STOP_SPEED:
                 continue
             lat, lon = dd["lat"], dd["lon"]
-            near_deliv = min((haversine_m(lat, lon, p[0], p[1])
-                              for p in lf.DELIVERY_POINTS), default=1e9) < DELIVERY_RADIUS_M
             near_depot = any(haversine_m(lat, lon, dep[0], dep[1]) < DEPOT_SUPPRESS_M
                              for dep in lf.DEPOTS.values())
-            if near_deliv and not near_depot:
-                cur_delivered.add(sid)
+            if near_depot:
+                continue
+            route = dd.get("route")
+            if route:
+                end = route[-1]
+                at_path_end = haversine_m(lat, lon, end[0], end[1]) < DELIVERY_RADIUS_M
+                if at_path_end:
+                    cur_delivered.add(sid)
+            else:
+                near_deliv = min((haversine_m(lat, lon, p[0], p[1])
+                                  for p in lf.DELIVERY_POINTS), default=1e9) < DELIVERY_RADIUS_M
+                if near_deliv:
+                    cur_delivered.add(sid)
 
         with lock:
             # ---- flight-rule channel: edge-triggered enter/clear ----
@@ -308,6 +355,7 @@ def evaluator(stop):
             for sid in cur_delivered - prev_delivered:
                 delivery_count += 1
                 delivered_ts[sid] = now
+                delivered_n[sid] = delivered_n.get(sid, 0) + 1
 
         prev = cur
         prev_sec = sec
@@ -325,7 +373,7 @@ def snapshot():
             if "lat" not in d or "last_seen" not in d:
                 continue  # heard a heartbeat/battery but no position yet
             age = now - d["last_seen"]
-            item = {k: v for k, v in d.items() if k != "last_seen"}
+            item = {k: v for k, v in d.items() if k not in ("last_seen", "route")}
             item["status"] = "active" if age < STALE_S else "stale"
             item["age_s"] = round(age, 1)
             item.setdefault("mode", None)
@@ -343,20 +391,32 @@ def snapshot():
             item["flight_codes"] = list(fa.keys())
             item["attacked"] = bool(sa)
             item["delivered_ts"] = delivered_ts.get(d["sysid"])
-            # Flight-plan path: current position -> destination, and (for the
-            # delivery fleet) on home to the depot.
+            item["delivered_n"] = delivered_n.get(d["sysid"], 0)
+            # Flight-plan path: current position, then every waypoint the
+            # drone has STILL TO FLY on its uploaded mission. Slicing at
+            # route_seq (from MISSION_CURRENT) is what keeps the white line
+            # correct for these long wandering tours — drawing the whole
+            # mission would run the line backwards through the legs already
+            # flown. SITL drones that never upload a mission fall back to the
+            # old straight-line guess: current position -> destination -> depot.
             plan = None
-            tlat, tlon = d.get("tgt_lat"), d.get("tgt_lon")
-            if tlat is not None:
-                pos = [d["lat"], d["lon"]]
-                depot = lf.DEPOTS.get(d.get("company"))
-                if d.get("kind") == "sim" and depot:
-                    if haversine_m(tlat, tlon, depot[0], depot[1]) < 120:
-                        plan = [pos, [depot[0], depot[1]]]
+            route = d.get("route")
+            if route:
+                seq = min(max(int(d.get("route_seq", 0)), 0), len(route) - 1)
+                ahead = route[seq:]
+                plan = [[d["lat"], d["lon"]]] + [[r[0], r[1]] for r in ahead]
+            else:
+                tlat, tlon = d.get("tgt_lat"), d.get("tgt_lon")
+                if tlat is not None:
+                    pos = [d["lat"], d["lon"]]
+                    depot = lf.DEPOTS.get(d.get("company"))
+                    if d.get("kind") == "sim" and depot:
+                        if haversine_m(tlat, tlon, depot[0], depot[1]) < 120:
+                            plan = [pos, [depot[0], depot[1]]]
+                        else:
+                            plan = [pos, [tlat, tlon], [depot[0], depot[1]]]
                     else:
-                        plan = [pos, [tlat, tlon], [depot[0], depot[1]]]
-                else:
-                    plan = [pos, [tlat, tlon]]
+                        plan = [pos, [tlat, tlon]]
             item["plan"] = plan
             drones.append(item)
         notif = [dict(n) for n in list(notifications)[:60]]
@@ -419,13 +479,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(json.dumps(snapshot()).encode(), "application/json")
         elif self.path in ("/", "/index.html"):
             try:
-                with open("utm_map.html", "rb") as f:
+                with open("map.html", "rb") as f:
                     self._send(f.read(), "text/html; charset=utf-8")
             except FileNotFoundError:
                 self._send(
                     b"<h1>GridEye aggregator is running</h1>"
                     b"<p>Live data: <a href='/api/drones'>/api/drones</a></p>"
-                    b"<p>The map page (utm_map.html) isn't in this folder yet.</p>",
+                    b"<p>The map page (map.html) isn't in this folder yet.</p>",
                     "text/html; charset=utf-8")
         else:
             self.send_response(404)
@@ -440,7 +500,7 @@ def reporter(stop):
         c = snap["counts"]
         alerting = snap["alerting"]
         extra = f"  ALERTS: {alerting}" if alerting else ""
-        print(f"[GridEye] {c['active']}/{c['total']} active  {c['by_company']}{extra}")
+        print(f"[grideye] {c['active']}/{c['total']} active  {c['by_company']}{extra}")
 
 
 def main():
@@ -450,7 +510,7 @@ def main():
     threading.Thread(target=reporter, args=(stop,), daemon=True).start()
 
     httpd = ThreadingHTTPServer(("127.0.0.1", HTTP_PORT), Handler)
-    print(f"[GridEye] serving  http://localhost:{HTTP_PORT}/   (api at /api/drones)")
+    print(f"[grideye] serving  http://localhost:{HTTP_PORT}/   (api at /api/drones)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -458,7 +518,7 @@ def main():
     finally:
         stop.set()
         httpd.shutdown()
-        print("\n[GridEye] stopped.")
+        print("\n[grideye] stopped.")
 
 
 if __name__ == "__main__":

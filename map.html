@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>GridEye — Drone Traffic Monitor</title>
+<title>GridEye — Airspace Monitoring</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -57,7 +57,33 @@
 
   .head{padding:18px 18px 15px; border-bottom:1px solid var(--line)}
   .title{font-family:var(--disp); font-size:21px; font-weight:700; letter-spacing:2px}
-  .title .fx{color:var(--instr)}
+  /* main console title — big cyber HUD treatment (scoped so the toast is untouched) */
+  .head .title{
+    font-size:36px; line-height:1; letter-spacing:6px; font-weight:700;
+    color:var(--instr);
+    text-transform:uppercase;
+    text-shadow:
+      0 0 4px rgba(63,208,201,.6),
+      0 0 16px rgba(63,208,201,.38),
+      0 0 34px rgba(63,208,201,.18);
+    animation:title-flicker 6s infinite steps(1);
+  }
+  /* framing brackets for the terminal/HUD feel */
+  .head .title::before{content:"[ "; color:var(--faint); text-shadow:none}
+  .head .title::after {content:" ]"; color:var(--faint); text-shadow:none}
+  /* the title tracks the alert condition — glows magenta under attack */
+  body.cond-security .head .title{
+    color:var(--attack);
+    text-shadow:
+      0 0 5px rgba(255,46,126,.65),
+      0 0 18px rgba(255,46,126,.4),
+      0 0 38px rgba(255,46,126,.2);
+  }
+  @keyframes title-flicker{
+    0%,97%,100%{opacity:1}
+    98%{opacity:.72}
+    99%{opacity:.9}
+  }
   .sub{font-size:10px; color:var(--muted); text-transform:uppercase;
     letter-spacing:3px; margin-top:3px}
   .live{display:flex; align-items:center; gap:7px; margin-top:12px;
@@ -341,7 +367,7 @@
     border:2px solid var(--c); background:rgba(0,0,0,.4)}
   .maplabel{font:600 11px var(--data); text-shadow:0 0 5px #000,0 0 5px #000;
     white-space:nowrap; box-sizing:border-box}
-  .maplabel.ao{font-weight:700; letter-spacing:1px; opacity:.92}
+  .maplabel.geofence{font-weight:700; letter-spacing:1px; opacity:.92}
   .maplabel.nfz{color:#ff8a8a; font-size:10px}
   @media (prefers-reduced-motion: reduce){
     .dot.pulse,.drone.alert::after,.drone.attack::before,.drone.attack::after,
@@ -353,8 +379,9 @@
   <div id="panel">
     <div id="panel-top">
       <div class="head">
-        <div class="title">GridEye<span class="fx">
-          <div class="sub">UAS Traffic Management</div>
+        <div class="title">GRIDEYE</div>
+        <div class="sub"><b>Frisco,TX</b></div>
+        <div class="sub">Low-Altitude Airspace Monitoring</div>
         <div class="live"><span class="dot pulse"></span><span id="status">connecting…</span></div>
       </div>
 
@@ -414,22 +441,23 @@
     const SEC_LABEL = {
       GHOST_ID:'Ghost aircraft (rogue node)', SRC_CONFLICT:'Source impersonation',
       TELEPORT:'Position spoofing', CLIMB_RATE:'Telemetry falsification',
-      VEL_MISMATCH:'Velocity spoofing', FLEET_GUIDED:'Fleet hijack',
+      VEL_MISMATCH:'Speed Warning', FLEET_GUIDED:'Fleet hijack',
       SRC_HANDOFF:'Session hijack', GPS_ATTACK:'GPS spoofing',
-      OUT_AO:'Outside area of ops',
+      OUT_AO:'Outside geofence',
     };
     // Short codes shown directly on the drone marker icon.
     const BADGE_LABEL = {
       GHOST_ID:'GHOST', SRC_CONFLICT:'IMPERSON', TELEPORT:'POS-SPOOF',
-      CLIMB_RATE:'FALSE-TLM', VEL_MISMATCH:'VEL-SPOOF', FLEET_GUIDED:'HIJACK',
-      SRC_HANDOFF:'SESS-HIJK', GPS_ATTACK:'GPS-SPOOF', OUT_AO:'OUT-AO',
+      CLIMB_RATE:'FALSE-TLM', VEL_MISMATCH:'SPEED', FLEET_GUIDED:'HIJACK',
+      SRC_HANDOFF:'SESS-HIJK', GPS_ATTACK:'GPS-SPOOF', OUT_AO:'OUT-GEO',
     };
     // Short amber badge shown on the marker for a flight-rule (advisory) code.
     // Mirrors anomalyLabel()'s vocabulary: HIGH/LOW/OUT_AO/NOFLY:<name>.
     function FLIGHT_BADGE_LABEL(code){
+      if(code === 'FAST')           return 'FAST';
       if(code === 'HIGH')           return 'HIGH';
       if(code === 'LOW')            return 'LOW';
-      if(code === 'OUT_AO')         return 'OUT-AO';
+      if(code === 'OUT_AO')         return 'OUT-GEO';
       if(code.startsWith('NOFLY:')) return 'NOFLY';
       return code;
     }
@@ -447,6 +475,10 @@
     const latest = {}, latestTrue = {};
     let hoverKey = null, planLine = null;
     const shownDelivery = {};
+    // Per-drone "pairs of deliveries already cleared for". Each time a drone's
+    // own completed-delivery count crosses a new multiple of 2, we wipe its
+    // trail so the line behind it starts fresh.
+    const trailClearedPairs = {};
     let firstDeliveryScan = true, depotsDrawn = false, zonesDrawn = false;
     const TRAIL_MAX = 80;
     let lastResetToken = null;
@@ -635,7 +667,7 @@
       (data.areas||[]).forEach(a=>{
         L.polygon(a.polygon, {color:a.color, weight:2, dashArray:'6 7',
           fill:false, interactive:false, pane:'trailPane'}).addTo(map);
-        textLabel(a.label, `${a.company.toUpperCase()} AO`, 'ao', a.color, a.label_dir).addTo(map);
+        textLabel(a.label, `${a.company.toUpperCase()} GEOFENCE`, 'geofence', a.color, a.label_dir).addTo(map);
       });
       (data.nofly||[]).forEach(z=>{
         L.circle([z.lat,z.lon], {radius:z.radius_m, color:'#ff5a5a', weight:1.5,
@@ -671,6 +703,17 @@
           trails[d.sysid]._pts = [];
         }
         const tr = trails[d.sysid];
+        // Every 2 deliveries this drone completes, wipe its trail so the line
+        // behind it restarts from the current position.
+        const pairs = Math.floor((d.delivered_n || 0) / 2);
+        if(trailClearedPairs[d.sysid] === undefined){
+          // First time we see this drone, sync without clearing (avoids a
+          // spurious wipe on page load for a drone that already has deliveries).
+          trailClearedPairs[d.sysid] = pairs;
+        } else if(pairs > trailClearedPairs[d.sysid]){
+          trailClearedPairs[d.sysid] = pairs;
+          tr._pts = [];
+        }
         tr._pts.push(ll); if(tr._pts.length>TRAIL_MAX) tr._pts.shift();
         tr.setLatLngs(tr._pts);
         // Keep company color at all times; just dim slightly when stale.
@@ -726,6 +769,7 @@
         if(!seen.has(+sid)){
           map.removeLayer(droneMarkers[sid]); delete droneMarkers[sid];
           if(trails[sid]){ map.removeLayer(trails[sid]); delete trails[sid]; }
+          delete trailClearedPairs[sid];
           delete latest[sid];
           if(hoverKey === +sid){ hoverKey = null; hidePlan(); }
         }
@@ -842,9 +886,10 @@
     }
 
     function anomalyLabel(code){
-      if(code === 'HIGH')             return 'Above ceiling';
+      if(code === 'FAST')             return 'Fast drone';
+      if(code === 'HIGH')             return 'Height Warning';
       if(code === 'LOW')              return 'Below floor';
-      if(code === 'OUT_AO')           return 'Outside area';
+      if(code === 'OUT_AO')           return 'Outside geofence';
       if(code.startsWith('NOFLY:'))   return `No-fly: ${code.split(':')[1]}`;
       return code;
     }
@@ -939,10 +984,12 @@
           const live = d.status==='active';
           const sd = live ? color : '#555';
           const cls = (d._attack?'attack ':'') + (live?'':'stale');
+          const fb = (d.flight_codes||[]).map(k=>
+            `<span class="badge badge-alert">${FLIGHT_BADGE_LABEL(k)}</span>`).join(' ');
           html += `<div class="row ${cls}">`
                 + `<span class="sd" style="background:${sd}"></span>`
                 + `<span class="id">#${d.sysid}</span>`
-                + `<span class="val">${d.alt_m} m</span>`
+                + `<span class="val">${d.alt_m} m${fb ? ' ' + fb : ''}</span>`
                 + `<span class="rd">${d.speed_ms} m/s</span></div>`;
         });
       });
@@ -959,12 +1006,12 @@
       if(active.length === 0){
         html += `<div class="al-none">no active advisories</div>`;
       } else {
-        // Show only the FIRST active flight alert (the pill still reflects the
-        // true total so the operator knows how many are in effect).
-        const a = active[0];
-        html += `<div class="al-row"><span class="sd" style="background:${a.d.color}"></span>`
-              + `<span class="id">#${a.d.sysid}</span>`
-              + `<span class="msg">${a.m}</span></div>`;
+        // List every active flight advisory (the pill still shows the total).
+        active.forEach(a => {
+          html += `<div class="al-row"><span class="sd" style="background:${a.d.color}"></span>`
+                + `<span class="id">#${a.d.sysid}</span>`
+                + `<span class="msg">${a.m}</span></div>`;
+        });
       }
       document.getElementById('alerts').innerHTML = html;
     }
