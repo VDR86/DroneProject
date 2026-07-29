@@ -581,13 +581,13 @@ def _scn_gpsattack(now, t_since, attacking):
 
 _COMBINED_BREACHES = [
     (2,  "HIGH",   (33.150, -96.850, 300.0),
-     "seized and force-climbed above the 122 m ceiling"),
+     "seized and being forced to climb toward the ceiling"),
     (3,  "LOW",    (33.120, -96.840, 5.0),
-     "seized and pushed below the 10 m floor out on a leg"),
+     "seized and being pushed toward the floor limit"),
     (4,  "OUT_AO", (33.150, -96.700, 80.0),
-     "seized and flown east out of Wing's area of operations"),
-    (14, "NOFLY",  (33.1150, -96.7520, 100.0),
-     "seized and flown into a restricted no-fly zone"),
+     "seized and diverted toward area of operations boundary"),
+    (14, "NOFLY",  (lf.NO_FLY_ZONES[0]["lat"], lf.NO_FLY_ZONES[0]["lon"], 100.0),
+     "seized and diverted toward restricted no-fly zone"),
 ]
 
 ENVELOPE_HOLD_S = 6.0
@@ -694,6 +694,17 @@ def snapshot():
             if "battery" in ov:
                 battery = ov["battery"]
             for code, msg in ov.get("alerts", []):
+                # Dynamically upgrade notification text once physical criteria are met
+                if scenario_key == "combined":
+                    if sid == 2 and alt_here > lf.MAX_ALT_M:
+                        msg = "seized and successfully climbed above the 122 m ceiling"
+                    elif sid == 3 and alt_here < lf.MIN_ALT_M:
+                        msg = "seized and successfully pushed below the 10 m floor"
+                    elif sid == 4 and not _point_in_poly(lat, lon, lf.AREAS_OF_OPERATION.get(company, [])):
+                        msg = "seized and successfully flown east out of Wing's area of operations"
+                    elif sid == 14 and lf.distance_m(lat, lon, lf.NO_FLY_ZONES[0]["lat"], lf.NO_FLY_ZONES[0]["lon"]) <= lf.NO_FLY_ZONES[0]["radius_m"]:
+                        msg = "seized and successfully flown into a restricted no-fly zone"
+                
                 alerts.append(f"ATTACK — {msg}")
                 by_code[code] = by_code.get(code, 0) + 1
             flagged_sysids.append(sid)
@@ -726,6 +737,20 @@ def snapshot():
 
         flight_codes = []
         for code, msg in _flight_rule_alerts(company, lat, lon, alt_here):
+            # Suppress rule warnings until physical boundary/limit is actually breached
+            if sid == 14 and scenario_key == "combined" and code.startswith("NOFLY"):
+                if breach_target and lf.distance_m(lat, lon, breach_target[0], breach_target[1]) > lf.NO_FLY_ZONES[0]["radius_m"]:
+                    continue
+            if sid == 2 and scenario_key == "combined" and code == "HIGH":
+                if alt_here <= lf.MAX_ALT_M:
+                    continue
+            if sid == 3 and scenario_key == "combined" and code == "LOW":
+                if alt_here >= lf.MIN_ALT_M:
+                    continue
+            if sid == 4 and scenario_key == "combined" and code == "OUT_AO":
+                if _point_in_poly(lat, lon, lf.AREAS_OF_OPERATION.get(company, [])):
+                    continue
+
             alerts.append(msg)
             flight_codes.append(code)
             by_code[code] = by_code.get(code, 0) + 1
@@ -753,7 +778,6 @@ def snapshot():
             gfc = []
             for code, msg in _flight_rule_alerts(
                     g.get("company"), g["lat"], g["lon"], g.get("alt_m", 0)):
-                # For true_pos (orange drone), only include OUT_AO when it's actually outside the AO
                 if g.get("kind") == "true_pos" and code == "OUT_AO" and not _point_in_wing_ao(g["lat"], g["lon"]):
                     continue
                 g.setdefault("alerts", []).append(msg)
