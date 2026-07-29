@@ -16,6 +16,7 @@ import math
 import threading
 import time
 import argparse
+import random
 
 from pymavlink import mavutil
 
@@ -24,7 +25,7 @@ from pymavlink import mavutil
 # Configuration
 # ---------------------------------------------------------------------------
 
-DEFAULT_TARGET = "udpout:127.0.0.1:14550"
+DEFAULT_TARGET = "udpout:127.0.0.1:14570"
 
 DEFAULT_DRONES = 50
 DEFAULT_RATE_HZ = 5
@@ -32,7 +33,7 @@ DEFAULT_RATE_HZ = 5
 CENTER_LAT = 33.125
 CENTER_LON = -96.772
 
-RADIUS_M = 300
+RADIUS_M = 15000
 
 
 # ---------------------------------------------------------------------------
@@ -55,13 +56,15 @@ def offset_position(lat, lon, north_m, east_m):
 
 
 def drone_position(drone_id, elapsed):
-    #Generate repeatable circular flight paths.
-    
+    # Teleport to a random point within RADIUS_M of the center.
 
-    angle = elapsed * 0.15 + drone_id
+    angle = random.uniform(0, 2 * math.pi)
 
-    north = math.sin(angle) * RADIUS_M
-    east = math.cos(angle) * RADIUS_M
+    # Uniform distribution over the circle
+    radius = RADIUS_M * math.sqrt(random.random())
+
+    north = math.sin(angle) * radius
+    east = math.cos(angle) * radius
 
     return offset_position(
         CENTER_LAT,
@@ -86,7 +89,7 @@ class SimDrone(threading.Thread):
         self.stop = stop
 
         self.start_time = time.monotonic()
-        time_since_boot = int((time.monotonic() - self.start_time) * 1000)
+        self.time_since_boot = int((time.monotonic() - self.start_time) * 1000)
 
 
     def send_heartbeat(self):
@@ -101,18 +104,18 @@ class SimDrone(threading.Thread):
 
     def send_position(self):
 
-        now = time.time() - self.start_time
-
+        self.time_since_boot = int((time.monotonic() - self.start_time) * 1000)
+	
         lat, lon = drone_position(
             self.sysid,
-            now
+            self.time_since_boot
         )
 
         alt_mm = 30000       # 30m
         rel_alt_mm = 30000
 
         self.master.mav.global_position_int_send(
-            time_since_boot,
+            self.time_since_boot,
             int(lat * 1e7),
             int(lon * 1e7),
             alt_mm,
@@ -137,19 +140,21 @@ class SimDrone(threading.Thread):
 
 
     def send_battery(self):
-
-        self.master.mav.sys_status_send(
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            75,
-            0,
-            0
-        )
+    	self.master.mav.sys_status_send(
+       	   0,      # sensors_present
+       	   0,      # sensors_enabled
+     	   0,      # sensors_health
+     	   0,      # load (0.1%)
+     	   12000,  # battery voltage (mV)
+	   -1,     # current (cA), -1 = unknown
+    	   75,     # battery remaining (%)
+           0,      # drop_rate_comm
+           0,      # errors_comm
+           0,      # errors_count1
+           0,      # errors_count2
+           0,      # errors_count3
+           0,      # errors_count4
+       )
 
 
     def run(self):
@@ -225,7 +230,7 @@ Press Ctrl+C to stop.
 
         for i in range(args.drones):
 
-            sysid = i + 10
+            sysid = i
 
             conn = mavutil.mavlink_connection(
                 args.target,
