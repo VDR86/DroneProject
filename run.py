@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-GridEye — project overview, run tutorial, and launcher
-======================================================
+Frisco UTM — project overview, run tutorial, and launcher
+=========================================================
 
-A local, self-contained UAS Traffic Management simulation, branded GridEye, for Frisco, TX.
+A local, self-contained UAS Traffic Management (UTM) simulation for Frisco, TX.
 Ten lightweight simulated delivery drones fly real Frisco geography and emit
 normal MAVLink telemetry over UDP; a read-only monitoring backend tracks them,
 applies flight rules, and runs a defensive (blue-team) layer that detects
@@ -15,7 +15,7 @@ transmits commands or produces an attack.
 WHAT EACH FILE DOES
 -------------------
 Core system
-  lightweight_fleet.py    Scenario single-source-of-truth + the simulator. Defines
+  frisco_fleet.py    Scenario single-source-of-truth + the simulator. Defines
                      depots, areas of operation, no-fly zones, altitude limits
                      (400 ft ceiling / 10 m floor), colours, map centre, and the
                      fleet roster. Running it launches ten lightweight drones
@@ -34,10 +34,12 @@ Core system
                      which detectors fired; attacked drones get a magenta
                      target-lock, flight-rule alerts get an amber ping. Hover a
                      drone to see a dashed line to its current destination.
+                     Auto-opens utm_compare.html in a second tab when a drone
+                     is flagged attacked.
 
 
 Defensive layer
-  grideye_guardian.py    The attack detector. Decoupled from pymavlink and the fleet
+  utm_guardian.py    The attack detector. Decoupled from pymavlink and the fleet
                      so it can be unit-tested with plain Python values. Flags seven
                      things: GHOST_ID (unknown id), SRC_CONFLICT (one id, two
                      sources), TELEPORT (impossible jump), CLIMB_RATE (impossible
@@ -68,7 +70,7 @@ THE MAIN RUN (the normal system)
 --------------------------------
 Two terminals, same folder:
 
-    Terminal 1:  python3 run.py fleet       (or: python3 lightweight_fleet.py)
+    Terminal 1:  python3 run.py fleet       (or: python3 frisco_fleet.py)
     Terminal 2:  python3 run.py monitor     (or: python3 aggregator.py)
 
 Then open http://localhost:8000/ in a browser. Do NOT open map.html as a
@@ -77,7 +79,7 @@ moving drones, condition NOMINAL, and an empty Security panel. Raw API is at
 http://localhost:8000/api/drones. Ctrl+C in each terminal to stop.
 
 (Optional) The two real ArduPilot SITL drones launch separately and feed the
-same ingest port via MAVProxy --out; see the RUN NOTES in lightweight_fleet.py.
+same ingest port via MAVProxy --out; see the RUN NOTES in frisco_fleet.py.
 
 RUNNING BOTH TOGETHER, EACH IN ITS OWN TERMINAL (python3 run.py)
 -----------------------------------------------------------------
@@ -167,10 +169,11 @@ import webbrowser
 
 # command -> (module to import + call .main() on, one-line help)
 COMMANDS = {
-    "fleet":    ("lightweight_fleet",   "Launch the 10 lightweight simulated drones"),
+    "fleet":    ("frisco_fleet",   "Launch the 10 lightweight simulated drones"),
     "monitor":  ("aggregator",     "Read-only monitor + dashboard on :8000"),
     "test":     ("test_guardian",  "Guardian unit tests, no network (expect 8/8)"),
     "selftest": ("ui_selftest",    "Serve the dashboard with a scripted canned feed"),
+    "tap":      ("ingest_tap",     "Passive read-only listener on the ingest port"),
 }
 
 # the two "fleet + X" pairings offered by the no-arg launcher
@@ -242,7 +245,7 @@ def _smoketest():
 
     here = os.path.dirname(os.path.abspath(__file__))
     fleet_p = subprocess.Popen(
-        [sys.executable, os.path.join(here, "lightweight_fleet.py")],
+        [sys.executable, os.path.join(here, "frisco_fleet.py")],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     mon_p = subprocess.Popen(
         [sys.executable, os.path.join(here, "aggregator.py")],
@@ -343,7 +346,7 @@ def _terminal_launch_cmd(title, script_path, cwd):
     if system == "Linux":
         # Try common terminal emulators in rough order of likelihood.
         candidates = [
-            ("x-terminal-emulator", ["-T", title, "-e", py, script_path]),
+            ("qterm", ["-e", py, script_path]),
             ("gnome-terminal",      ["--title", title, "--", py, script_path]),
             ("konsole",             ["-p", f"tabtitle={title}", "-e", py, script_path]),
             ("xfce4-terminal",      ["--title", title, "-e", f"{py} {script_path}"]),
@@ -431,8 +434,8 @@ def _up(mode=None):
         print("[run] (run 'python3 run.py --help' to see individual commands)")
         return 1
 
-    _launch_in_terminal("GridEye - Fleet", "lightweight_fleet.py")
-    _launch_in_terminal(f"GridEye - {second_label}", f"{second_modname}.py")
+    _launch_in_terminal("Frisco UTM - Fleet", "frisco_fleet.py")
+    _launch_in_terminal(f"Frisco UTM - {second_label}", f"{second_modname}.py")
 
     time.sleep(1.5)
     print(f"[run] fleet + {second_modname} launched, each in its own terminal window.")
@@ -445,12 +448,10 @@ def _up(mode=None):
     if mode == "selftest":
         print("[run] dashboard: http://localhost:8000/")
         print(f"[run] switch to the {mode} window to control the attack:")
-        print("[run]   1  Fleet takeover (GUIDED convergence + scatter runaway)")
+        print("[run]   1  Fleet takeover (GUIDED convergence + SRC_CONFLICT + scatter runaway)")
         print("[run]   2  Ghost aircraft (unknown sysid)")
         print("[run]   3  Climb-rate + velocity mismatch")
         print("[run]   4  Gradual escalation (stages in over ~12s)")
-        print("[run]   5  GPS spoofing (false reported position)")
-        print("[run]   6  Combined Attack (hijack hits all flight rules)")
         print("[run]   a  Start attack    c  Clear to NOMINAL    q  Quit")
         print("[run] to stop, Ctrl+C (or close) each of the 2 terminal windows.")
     return 0
