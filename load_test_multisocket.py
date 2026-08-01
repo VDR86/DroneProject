@@ -1,15 +1,15 @@
 """
-utm_load_test.py
+load_test_multisocket.py
 ================
 
-Controlled MAVLink telemetry load generator for testing utm_aggregator.py.
+Controlled MAVLink telemetry load generator for testing aggregator.py.
 
 Usage:
     python3 utm_load_test.py
 
 Make sure:
-    - utm_aggregator.py is running
-    - UDP ingest port matches frisco_fleet.INGEST_PORT
+    - aggregator.py is running
+    - UDP ingest port matches lightweight_fleet.INGEST_PORT
 """
 
 import math
