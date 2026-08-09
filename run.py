@@ -343,7 +343,7 @@ def _terminal_launch_cmd(title, script_path, cwd):
     if system == "Linux":
         # Try common terminal emulators in rough order of likelihood.
         candidates = [
-            ("qterm", ["-e", py, script_path]),
+            ("x-terminal-emulator", ["-T", title, "-e", py, script_path]),
             ("gnome-terminal",      ["--title", title, "--", py, script_path]),
             ("konsole",             ["-p", f"tabtitle={title}", "-e", py, script_path]),
             ("xfce4-terminal",      ["--title", title, "-e", f"{py} {script_path}"]),

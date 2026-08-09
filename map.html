@@ -411,7 +411,7 @@
         <div><span class="k" style="color:#ff6600">◌</span> true position (GPS spoofing victim)</div>
         <div><span class="k">◆</span> company depot</div>
         <div><span class="k" style="color:#ff5a5a">⛔</span> no-fly zone</div>
-        <div><span class="k" style="color:#22d3ee">┅</span> flight plan (on hover)</div>
+        <div><span class="k" style="color:#22d3ee">┅</span> flight plan + waypoints (on hover)</div>
       </div>
     </div>
   </div>
@@ -504,28 +504,64 @@
     map.getPane('trailPane').style.zIndex = 350;
     map.getPane('trailPane').style.pointerEvents = 'none';
 
+    // Waypoint pane: sits just above trails but below drone markers, so the
+    // flight-plan waypoint dots show over the trail lines yet never cover the
+    // aircraft icons. Non-interactive — read-only plan markers.
+    map.createPane('wptPane');
+    map.getPane('wptPane').style.zIndex = 355;
+    map.getPane('wptPane').style.pointerEvents = 'none';
+
+    // Flight-plan waypoint dots — shown ONLY while hovering a drone, together
+    // with the plan line (see showPlan / hidePlan). One layer group we rebuild
+    // on each hover and drop again on mouse-out.
+    let planWpts = null;
+    function clearPlanWpts(){ if(planWpts){ map.removeLayer(planWpts); planWpts = null; } }
+    function drawPlanWpts(pts, color, stale){
+      clearPlanWpts();
+      planWpts = L.layerGroup([], {pane:'wptPane'});
+      pts.forEach((w, i)=>{
+        const isLast = i === pts.length - 1;          // the delivery drop-off
+        L.circleMarker([w[0], w[1]], {
+          pane:'wptPane', interactive:false,
+          radius: isLast ? 5 : 3.5, weight: 1,
+          color:'#ffffff', opacity: stale ? .4 : 1,
+          fillColor: color, fillOpacity: stale ? .4 : .95,
+        }).addTo(planWpts);
+      });
+      planWpts.addTo(map);
+    }
+
     // planLine: shown only while hovering a drone marker, in trailPane so it
     // sits behind markers. hoverKey is either a numeric sysid (normal drone)
     // or a string "true_<sysid>" (true_pos ghost).
 
     function showPlan(key){
-      // Never show a plan line for true_pos ghosts or any attacked/anomaly drone —
+      // Never show a plan for true_pos ghosts or any attacked/anomaly drone —
       // a hacked drone's declared plan can't be trusted.
       if(typeof key === 'string' && key.startsWith('true_')){ hidePlan(); return; }
       const d = latest[key];
       if(!d || d._attack){ hidePlan(); return; }
-      if(!d.plan || d.plan.length < 2){ hidePlan(); return; }
+      // Prefer the FULL filed plan (all 5 waypoints) so the hovered path always
+      // shows its complete set of waypoints; fall back to the ahead-only plan
+      // (e.g. SITL drones that never upload a mission).
+      const wp = (d.waypoints && d.waypoints.length >= 2) ? d.waypoints : d.plan;
+      if(!wp || wp.length < 2){ hidePlan(); return; }
       if(planLine){
-        planLine.setLatLngs(d.plan);
+        planLine.setLatLngs(wp);
         planLine.setStyle({color:'#ffffff'});
       } else {
-        planLine = L.polyline(d.plan, {
+        planLine = L.polyline(wp, {
           color:'#ffffff', weight:1.5, dashArray:'4 8', opacity:.9,
           interactive:false, pane:'trailPane',
         }).addTo(map);
       }
+      // The waypoint dots ride along with the hover, one per filed waypoint.
+      drawPlanWpts(wp, d.color, d.status === 'stale');
     }
-    function hidePlan(){ if(planLine){ map.removeLayer(planLine); planLine = null; } }
+    function hidePlan(){
+      if(planLine){ map.removeLayer(planLine); planLine = null; }
+      clearPlanWpts();
+    }
 
     let comparedIds = new Set();  // sysids already auto-opened in the /compare tab
     function maybeAutoCompare(flaggedList){

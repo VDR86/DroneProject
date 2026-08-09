@@ -418,6 +418,10 @@ def snapshot():
                     else:
                         plan = [pos, [tlat, tlon]]
             item["plan"] = plan
+            # Full filed flight-plan waypoints (the whole uploaded mission, not
+            # just the part still ahead) so the UTM dashboard can render each
+            # drone's planned waypoints. SITL / no-mission drones expose none.
+            item["waypoints"] = [[r[0], r[1]] for r in route] if route else None
             drones.append(item)
         notif = [dict(n) for n in list(notifications)[:60]]
     drones.sort(key=lambda x: x["sysid"])

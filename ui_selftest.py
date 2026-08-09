@@ -33,11 +33,10 @@ What it is NOT
 This is a front-end test only. It serves canned JSON to your browser. It does
 not speak MAVLink, does not connect to or command any drone, and does not send
 anything to the real aggregator. It cannot attack anything — it only feeds the
-webpage a fixed response so you can confirm the display works. The scatter-offset
-constants it uses for the staged "jump" are inlined below (they mirror
-fleet_attack.py's fan-out offsets), so this file has NO dependency on
-fleet_attack.py and never touches any of its networking code.
-It borrows lightweight_fleet.py's depots/delivery-points/speed constants
+webpage a fixed response so you can confirm the display works. Importing the
+two offset constants from fleet_attack.py is the only thing this file takes
+from it; it never imports or runs any of fleet_attack.py's networking code.
+Likewise, it borrows lightweight_fleet.py's depots/delivery-points/speed constants
 to compute positions, but never opens lightweight_fleet.py's MAVLink connection —
 every non-attacked drone flies the exact same depot->delivery->depot route the
 real fleet would (same RNG seed per sysid, so the same delivery picks), while
@@ -58,9 +57,8 @@ Stop the real aggregator first (this uses the same port 8000), then:
 back to this terminal and press 1-4 to pick a scenario, Enter (or a) to fire
 it and watch the console react, c to go back to NOMINAL.
 
-Requires lightweight_fleet.py in the same folder (geography constants only — its
-MAVLink connection is never opened). fleet_attack.py is NOT required; the
-scatter-offset constants it used to borrow are now inlined below.
+Requires lightweight_fleet.py AND fleet_attack.py in the same folder (geography and
+the scatter-offset constants — neither is actually connected to).
 """
 
 import json
@@ -75,14 +73,13 @@ from urllib.parse import urlparse, parse_qs
 
 import lightweight_fleet as lf  # reuse the real geography so the map matches
 
-# Staged "jump" offset for the scripted attack. These mirror the (lat, lon)
-# fan-out offset fleet_attack.py uses when a hijacked fleet scatters (its
-# ATTACK_LAT_OFFSET_DEG / ATTACK_LON_OFFSET_DEG, see scatter_fleet() there).
-# They are inlined here on purpose so this display fixture has NO dependency on
-# fleet_attack.py and runs standalone. If you change the offsets in that tool
-# and want the fixture to keep matching, update these two values to match.
-ATTACK_LAT_OFFSET_DEG = 0.0015
-ATTACK_LON_OFFSET_DEG = 0.0015
+# Reuse fleet_attack.py's own numbers for the staged "jump": that tool fans a
+# hijacked fleet out from its real position by this exact (lat, lon) offset in
+# degrees when it fires (see ATTACK_LAT_OFFSET_DEG/ATTACK_LON_OFFSET_DEG and
+# scatter_fleet() there). Importing the constants means this display fixture's
+# fake attack always matches whatever the real tool actually does, instead of
+# being a made-up number that could quietly drift out of sync.
+from fleet_attack import ATTACK_LAT_OFFSET_DEG, ATTACK_LON_OFFSET_DEG
 
 HTTP_PORT = 8000
 TAKEOVER_AT = 10.0   # in "auto" mode: seconds into the loop before the attack
@@ -219,13 +216,13 @@ def _clean_path_tick(state, company, t, speed_mult=1.0):
     elif state["phase"] == "drop":
         if t >= state["hover_until"]:
             state["phase"] = "to_depot"
-            state["route"] = lf.return_route(state["route_idx"], lf.DEPOTS[company])
+            state["route"] = lf.return_route(company, state["route_idx"], lf.DEPOTS[company])
             state["leg_idx"] = 0
     elif state["phase"] == "rest":
         if t >= state["hover_until"]:
-            state["route_idx"] = lf.pick_route_idx(state["rng"])
-            state["target"] = lf.delivery_point(state["route_idx"])
-            state["route"] = lf.outbound_route(state["route_idx"])
+            state["route_idx"] = lf.pick_route_idx(company, state["rng"])
+            state["target"] = lf.delivery_point(company, state["route_idx"])
+            state["route"] = lf.outbound_route(company, state["route_idx"])
             state["leg_idx"] = 0
             state["phase"] = "to_delivery"
 
@@ -284,8 +281,8 @@ def _clean_path_pos(sid, company, now, hijacked, speed_mult=1.0,
         if state is None:
             depot = lf.DEPOTS[company]
             rng = random.Random(sid * 104729)
-            route_idx = lf.pick_route_idx(rng)
-            route = lf.outbound_route(route_idx)
+            route_idx = lf.pick_route_idx(company, rng)
+            route = lf.outbound_route(company, route_idx)
             state = {
                 "lat": depot[0], "lon": depot[1], "rel_alt": 0.0,
                 "hdg": lf.bearing_deg(depot[0], depot[1], route[0][0], route[0][1]),
@@ -294,7 +291,7 @@ def _clean_path_pos(sid, company, now, hijacked, speed_mult=1.0,
                 "break_since": None, "break_from": None,
                 "sid_phase": (sid % 7) * 0.9,
             }
-            state["target"] = lf.delivery_point(route_idx)
+            state["target"] = lf.delivery_point(company, route_idx)
             state["route"] = route
             state["leg_idx"] = 0
             CLEAN_PATH_STATE[sid] = state

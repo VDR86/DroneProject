@@ -10,10 +10,12 @@ Two delivery companies operate over Frisco, TX:
 
 Running THIS file launches only the 10 LIGHTWEIGHT drones (Wing 2..6,
 Zipline 12..16). They each fly depot -> delivery -> depot over real Frisco
-landmarks along a rectangular survey plan drawn at random from the shared
-ROUTE_LIBRARY — the waypoints themselves are frozen, but WHICH tour a drone
-flies is re-rolled every cycle, so drones swap routes and two of them can be
-on the same tour at once. A drone drops exactly once per trip, on reaching
+geography along a direct transit plan drawn at random from THEIR OWN COMPANY's
+route pool (ROUTE_LIBRARIES["Wing"] or ROUTE_LIBRARIES["Zipline"]) — the
+waypoints themselves are frozen, but WHICH plan a drone flies is re-rolled every
+cycle, so drones of the same company swap routes and two of them can be on the
+same plan at once. Each company's plans stay inside that company's own area of
+operation and fan out to fill it. A drone drops exactly once per trip, on reaching
 the final waypoint of its tour (broadcast as a MISSION_COUNT /
 MISSION_ITEM_INT sequence, same as a real GCS mission upload) and emit normal
 MAVLink (HEARTBEAT + GLOBAL_POSITION_INT) over UDP, so the GridEye aggregator
@@ -72,136 +74,144 @@ FLEET = {
     15: ("Zipline", "sim"), 16: ("Zipline", "sim"),
 }
 
-# Delivery destinations spread across real Frisco landmarks + a bunch of
-# scattered residential points, so the fleet fans out across the whole suburb.
-DELIVERY_POINTS = [
-    (33.1104, -96.8280),  # The Star
-    (33.0991, -96.8114),  # Stonebriar Centre
-    (33.1509, -96.8318),  # Frisco Square
-    (33.2130, -96.8494),  # Omni PGA Resort (north)
-    (33.1543, -96.8352),  # Toyota Stadium
-    (33.1820, -96.8050),  # scattered NE
-    (33.1300, -96.8600),  # scattered SW
-    (33.1230, -96.8050),  # scattered SE
-    (33.1700, -96.8250),  # scattered N-central
-    (33.1400, -96.7950),  # scattered E
-    (33.1920, -96.8650),  # scattered NW
-    (33.0930, -96.8420),  # scattered S-central
-    (33.1650, -96.7850),  # scattered NE-2
-    (33.1050, -96.7920),  # scattered SE-2
-    (33.2000, -96.8150),  # scattered N
-    (33.1250, -96.8900),  # scattered W
-]
+# Delivery destinations. These are now the union of every drop-off in the two
+# per-company route libraries below (each library's drop-offs fill that
+# company's whole area of operation). Kept as a flat list because the aggregator
+# imports it to decide when a drone has reached *a* delivery point. Single source
+# of truth: it is rebuilt from ROUTE_LIBRARIES at import time, just below the
+# libraries, so it can never drift out of sync with the routes.
+DELIVERY_POINTS = []  # populated from ROUTE_LIBRARIES after they are defined
 
 # ---------------------------------------------------------------------------
-# SHARED ROUTE LIBRARY  (the pool every drone draws from)
+# PER-COMPANY ROUTE LIBRARIES  (one pool per company; each drone draws its own)
 # ---------------------------------------------------------------------------
-# One pool of frozen delivery plans, NOT one route per drone. Every drone picks
-# a route from this list at random each time it leaves its depot, so the
-# assignment is randomised and any two drones may end up flying the same plan
-# (or swap plans between cycles) -- exactly like a real dispatcher handing out
-# whatever job is next off the queue.
+# TWO frozen pools of delivery plans -- one for Wing, one for Zipline -- NOT one
+# route per drone. Every drone picks a route at random from ITS OWN company's
+# pool each time it leaves the depot, so the assignment is randomised and any
+# two drones of the same company may end up flying the same plan (or swap plans
+# between cycles) -- exactly like a dispatcher handing out whatever job is next
+# off that company's queue. (This is the "different path for each drone"
+# behaviour, unchanged -- only WHICH pool a drone draws from is now per-company.)
 #
 # Each entry is the list of waypoints AFTER the depot:
 #
-#     [ staging, elbow, box_v1 ... box_vN, delivery point ]
+#     [ climb-out, cruise, turn, approach, delivery point ]
 #
-# These are REALISTIC RECTANGULAR flight plans, the shape a ground-control
-# station actually generates: a straight transit corridor out of shared
-# airspace (staging point, then one grid-aligned dog-leg / "elbow"), followed
-# by an axis-aligned boustrophedon "lawnmower" survey box over the delivery
-# neighbourhood -- parallel legs joined by 90-degree turns -- finishing on the
-# drop-off LAST. Frisco's street grid is close to N-S / E-W aligned, so the
-# right-angle routing is also what keeps a drone over legal right-of-way. The
-# drone turns at every vertex and does not stop at any of them -- it hovers and
-# drops exactly once, on reaching that final waypoint. The trip home is the
-# same plan flown in reverse.
+# These are REAL delivery corridors: two straight legs joined by ONE gentle turn.
+# The drone departs the depot on a straight climb-out + cruise leg, makes a single
+# course change at 'turn', then flies a straight approach to the drop-off (flown
+# LAST). climb-out and cruise lie ON the depot->turn line and approach lies ON the
+# turn->delivery line, so the ONLY heading change on the whole path is that single
+# dog-leg -- the routes never zig-zag. The drone hovers and drops exactly once, on
+# reaching that final waypoint; the trip home is the same plan flown in reverse.
 #
-# Because any drone can draw any route, every vertex lies inside BOTH
-# companies' areas of operation and every plan ends on a delivery point that
-# is valid for both, so a Wing drone flying a route a Zipline drone flew last
-# cycle never leaves its own airspace. The depot connector legs are checked
-# per company. These were generated and validated by gen_pool.py.
-ROUTE_LIBRARY = [
-    [  # route 0 — 10 vertices, 9.6 km, delivers at (33.1104, -96.828)
-        (33.1348, -96.8264), (33.1189, -96.8264), (33.1189, -96.8221),
-        (33.1189, -96.8339), (33.1064, -96.8339), (33.1064, -96.8221),
-        (33.1105, -96.8221), (33.1105, -96.8339), (33.1147, -96.8339),
-        (33.1147, -96.8221), (33.1104, -96.828),
+# Every vertex of a company's routes lies INSIDE THAT COMPANY'S OWN area of
+# operation (with a safety margin), and the delivery points are spread on a grid
+# across the whole AO, so each company's routes fan out and FILL its entire area.
+# Because a drone only ever draws from its own company's pool, it can never be
+# handed a route that leaves its airspace. Generated and validated by
+# gen_routes.py (point-in-polygon + edge-margin check on every rounded vertex).
+ROUTE_LIBRARIES = {
+    "Wing": [
+        [  # route 0 — 5 waypoints, ~1.8 km one-way, delivers at (33.1385, -96.8738)
+            (33.1535, -96.87), (33.1492, -96.8698), (33.146, -96.8696), (33.1419, -96.8719), (33.1385, -96.8738),
+        ],
+        [  # route 1 — 5 waypoints, ~2.1 km one-way, delivers at (33.1735, -96.8738)
+            (33.1553, -96.8699), (33.1605, -96.8695), (33.1643, -96.8691), (33.1693, -96.8717), (33.1735, -96.8738),
+        ],
+        [  # route 2 — 5 waypoints, ~2.6 km one-way, delivers at (33.1385, -96.8492)
+            (33.1537, -96.8687), (33.1507, -96.8622), (33.1485, -96.8574), (33.143, -96.8529), (33.1385, -96.8492),
+        ],
+        [  # route 3 — 5 waypoints, ~2.8 km one-way, delivers at (33.1735, -96.8492)
+            (33.1551, -96.8687), (33.159, -96.8619), (33.1618, -96.8569), (33.1682, -96.8527), (33.1735, -96.8492),
+        ],
+        [  # route 4 — 5 waypoints, ~4.5 km one-way, delivers at (33.1385, -96.8247)
+            (33.154, -96.8675), (33.1522, -96.8546), (33.1509, -96.8451), (33.1441, -96.8339), (33.1385, -96.8247),
+        ],
+        [  # route 5 — 5 waypoints, ~4.6 km one-way, delivers at (33.1735, -96.8247)
+            (33.1548, -96.8675), (33.1575, -96.8543), (33.1595, -96.8447), (33.1672, -96.8337), (33.1735, -96.8247),
+        ],
+        [  # route 6 — 5 waypoints, ~5.8 km one-way, delivers at (33.1035, -96.8492)
+            (33.1519, -96.8684), (33.1395, -96.8601), (33.1305, -96.854), (33.1156, -96.8514), (33.1035, -96.8492),
+        ],
+        [  # route 7 — 5 waypoints, ~6.1 km one-way, delivers at (33.2085, -96.8492)
+            (33.1569, -96.8684), (33.1702, -96.8601), (33.1799, -96.854), (33.1956, -96.8514), (33.2085, -96.8492),
+        ],
+        [  # route 8 — 5 waypoints, ~6.5 km one-way, delivers at (33.1385, -96.8002)
+            (33.154, -96.8664), (33.1524, -96.8474), (33.1512, -96.8336), (33.1442, -96.8153), (33.1385, -96.8002),
+        ],
+        [  # route 9 — 5 waypoints, ~6.6 km one-way, delivers at (33.1735, -96.8002)
+            (33.1548, -96.8663), (33.1573, -96.8472), (33.1592, -96.8333), (33.1671, -96.8151), (33.1735, -96.8002),
+        ],
+        [  # route 10 — 5 waypoints, ~6.8 km one-way, delivers at (33.1035, -96.8247)
+            (33.1521, -96.8673), (33.1404, -96.853), (33.1319, -96.8426), (33.1163, -96.8328), (33.1035, -96.8247),
+        ],
+        [  # route 11 — 5 waypoints, ~7.1 km one-way, delivers at (33.2085, -96.8247)
+            (33.1567, -96.8673), (33.1693, -96.853), (33.1786, -96.8425), (33.195, -96.8328), (33.2085, -96.8247),
+        ],
+        [  # route 12 — 5 waypoints, ~8.3 km one-way, delivers at (33.1035, -96.8002)
+            (33.1521, -96.8661), (33.1409, -96.846), (33.1326, -96.8313), (33.1166, -96.8142), (33.1035, -96.8002),
+        ],
+        [  # route 13 — 5 waypoints, ~8.5 km one-way, delivers at (33.2085, -96.8002)
+            (33.1566, -96.8661), (33.1689, -96.8459), (33.1778, -96.8311), (33.1947, -96.8141), (33.2085, -96.8002),
+        ],
     ],
-    [  # route 1 — 10 vertices, 9.8 km, delivers at (33.0991, -96.8114)
-        (33.1297, -96.8189), (33.1076, -96.8189), (33.1076, -96.8173),
-        (33.0951, -96.8173), (33.0951, -96.8055), (33.0992, -96.8055),
-        (33.0992, -96.8173), (33.1034, -96.8173), (33.1034, -96.8055),
-        (33.1076, -96.8055), (33.0991, -96.8114),
+    "Zipline": [
+        [  # route 0 — 5 waypoints, ~2.1 km one-way, delivers at (33.137, -96.766)
+            (33.119, -96.772), (33.1243, -96.7718), (33.1281, -96.7717), (33.133, -96.7686), (33.137, -96.766),
+        ],
+        [  # route 1 — 5 waypoints, ~2.6 km one-way, delivers at (33.103, -96.794)
+            (33.1175, -96.7733), (33.1147, -96.7802), (33.1127, -96.7851), (33.1074, -96.79), (33.103, -96.794),
+        ],
+        [  # route 2 — 5 waypoints, ~2.9 km one-way, delivers at (33.137, -96.794)
+            (33.1187, -96.7734), (33.1225, -96.7805), (33.1253, -96.7857), (33.1317, -96.7903), (33.137, -96.794),
+        ],
+        [  # route 3 — 5 waypoints, ~4.8 km one-way, delivers at (33.103, -96.822)
+            (33.1177, -96.7747), (33.1162, -96.7887), (33.1152, -96.799), (33.1085, -96.8116), (33.103, -96.822),
+        ],
+        [  # route 4 — 5 waypoints, ~5.0 km one-way, delivers at (33.137, -96.822)
+            (33.1185, -96.7747), (33.1211, -96.789), (33.123, -96.7994), (33.1307, -96.8118), (33.137, -96.822),
+        ],
+        [  # route 5 — 5 waypoints, ~5.7 km one-way, delivers at (33.171, -96.766)
+            (33.1206, -96.7711), (33.1341, -96.7665), (33.144, -96.7631), (33.1589, -96.7647), (33.171, -96.766),
+        ],
+        [  # route 6 — 5 waypoints, ~6.0 km one-way, delivers at (33.171, -96.794)
+            (33.1205, -96.7737), (33.1334, -96.7823), (33.1429, -96.7886), (33.1583, -96.7916), (33.171, -96.794),
+        ],
+        [  # route 7 — 5 waypoints, ~7.2 km one-way, delivers at (33.103, -96.85)
+            (33.1177, -96.776), (33.1163, -96.797), (33.1153, -96.8123), (33.1085, -96.833), (33.103, -96.85),
+        ],
+        [  # route 8 — 5 waypoints, ~7.2 km one-way, delivers at (33.171, -96.822)
+            (33.1203, -96.775), (33.1325, -96.7904), (33.1414, -96.8016), (33.1577, -96.8128), (33.171, -96.822),
+        ],
+        [  # route 9 — 5 waypoints, ~7.3 km one-way, delivers at (33.137, -96.85)
+            (33.1194, -96.7757), (33.1268, -96.7952), (33.1322, -96.8094), (33.1349, -96.8317), (33.137, -96.85),
+        ],
+        [  # route 10 — 5 waypoints, ~9.0 km one-way, delivers at (33.171, -96.85)
+            (33.1203, -96.7763), (33.1321, -96.7985), (33.1407, -96.8147), (33.1573, -96.8341), (33.171, -96.85),
+        ],
+        [  # route 11 — 5 waypoints, ~9.5 km one-way, delivers at (33.205, -96.794)
+            (33.1225, -96.7725), (33.1456, -96.7752), (33.1625, -96.7772), (33.1859, -96.7865), (33.205, -96.794),
+        ],
+        [  # route 12 — 5 waypoints, ~10.3 km one-way, delivers at (33.205, -96.822)
+            (33.1221, -96.775), (33.1436, -96.7908), (33.1594, -96.8023), (33.1845, -96.8131), (33.205, -96.822),
+        ],
+        [  # route 13 — 5 waypoints, ~11.6 km one-way, delivers at (33.205, -96.85)
+            (33.1226, -96.7754), (33.1468, -96.7933), (33.1645, -96.8063), (33.1868, -96.8303), (33.205, -96.85),
+        ],
     ],
-    [  # route 2 — 10 vertices, 7.9 km, delivers at (33.1509, -96.8318)
-        (33.153, -96.8281), (33.151, -96.8281), (33.151, -96.8259),
-        (33.151, -96.8377), (33.1552, -96.8377), (33.1552, -96.8259),
-        (33.1594, -96.8259), (33.1594, -96.8377), (33.1469, -96.8377),
-        (33.1469, -96.8259), (33.1509, -96.8318),
-    ],
-    [  # route 3 — 10 vertices, 10.6 km, delivers at (33.213, -96.8494)
-        (33.1809, -96.836), (33.209, -96.836), (33.209, -96.8435),
-        (33.2131, -96.8435), (33.2131, -96.8553), (33.2173, -96.8553),
-        (33.2173, -96.8435), (33.2215, -96.8435), (33.2215, -96.8553),
-        (33.209, -96.8553), (33.213, -96.8494),
-    ],
-    [  # route 4 — 10 vertices, 7.5 km, delivers at (33.1543, -96.8352)
-        (33.1545, -96.8296), (33.1544, -96.8296), (33.1544, -96.8293),
-        (33.1544, -96.8411), (33.1586, -96.8411), (33.1586, -96.8293),
-        (33.1628, -96.8293), (33.1628, -96.8411), (33.1503, -96.8411),
-        (33.1503, -96.8293), (33.1543, -96.8352),
-    ],
-    [  # route 5 — 10 vertices, 8.6 km, delivers at (33.182, -96.805)
-        (33.167, -96.8161), (33.178, -96.8161), (33.178, -96.8109),
-        (33.178, -96.7991), (33.1821, -96.7991), (33.1821, -96.8109),
-        (33.1863, -96.8109), (33.1863, -96.7991), (33.1905, -96.7991),
-        (33.1905, -96.8109), (33.182, -96.805),
-    ],
-    [  # route 6 — 10 vertices, 4.7 km, delivers at (33.13, -96.86)
-        (33.1436, -96.8408), (33.1337, -96.8408), (33.1337, -96.8586),
-        (33.1337, -96.8614), (33.1308, -96.8614), (33.1308, -96.8586),
-        (33.1318, -96.8586), (33.1318, -96.8614), (33.1327, -96.8614),
-        (33.1327, -96.8586), (33.13, -96.86),
-    ],
-    [  # route 7 — 10 vertices, 8.7 km, delivers at (33.123, -96.805)
-        (33.1404, -96.8161), (33.1315, -96.8161), (33.1315, -96.8109),
-        (33.119, -96.8109), (33.119, -96.7991), (33.1231, -96.7991),
-        (33.1231, -96.8109), (33.1273, -96.8109), (33.1273, -96.7991),
-        (33.1315, -96.7991), (33.123, -96.805),
-    ],
-    [  # route 8 — 10 vertices, 7.9 km, delivers at (33.17, -96.825)
-        (33.1616, -96.8251), (33.166, -96.8251), (33.166, -96.8309),
-        (33.166, -96.8191), (33.1701, -96.8191), (33.1701, -96.8309),
-        (33.1743, -96.8309), (33.1743, -96.8191), (33.1785, -96.8191),
-        (33.1785, -96.8309), (33.17, -96.825),
-    ],
-    [  # route 9 — 10 vertices, 8.2 km, delivers at (33.14, -96.795)
-        (33.1481, -96.8116), (33.1485, -96.8116), (33.1485, -96.8009),
-        (33.136, -96.8009), (33.136, -96.7891), (33.1401, -96.7891),
-        (33.1401, -96.8009), (33.1443, -96.8009), (33.1443, -96.7891),
-        (33.1485, -96.7891), (33.14, -96.795),
-    ],
-    [  # route 10 — 10 vertices, 10.6 km, delivers at (33.093, -96.842)
-        (33.1269, -96.8327), (33.1015, -96.8327), (33.1015, -96.8361),
-        (33.1015, -96.8479), (33.089, -96.8479), (33.089, -96.8361),
-        (33.0931, -96.8361), (33.0931, -96.8479), (33.0973, -96.8479),
-        (33.0973, -96.8361), (33.093, -96.842),
-    ],
-    [  # route 11 — 10 vertices, 7.7 km, delivers at (33.105, -96.792)
-        (33.1323, -96.8102), (33.1105, -96.8102), (33.1105, -96.7951),
-        (33.104, -96.7951), (33.104, -96.7889), (33.1062, -96.7889),
-        (33.1062, -96.7951), (33.1083, -96.7951), (33.1083, -96.7889),
-        (33.1105, -96.7889), (33.105, -96.792),
-    ],
-    [  # route 12 — 10 vertices, 9.2 km, delivers at (33.2, -96.815)
-        (33.1751, -96.8206), (33.196, -96.8206), (33.196, -96.8209),
-        (33.196, -96.8091), (33.2001, -96.8091), (33.2001, -96.8209),
-        (33.2043, -96.8209), (33.2043, -96.8091), (33.2085, -96.8091),
-        (33.2085, -96.8209), (33.2, -96.815),
-    ],
-]
+}
+
+# Back-compat alias: the combined pool (both companies). Nothing in the fleet
+# draws from this any more -- each drone uses its company's list via the helpers
+# below -- but keeping the old name defined avoids AttributeErrors if any tool
+# still references ROUTE_LIBRARY. It is NOT used for route assignment.
+ROUTE_LIBRARY = ROUTE_LIBRARIES["Wing"] + ROUTE_LIBRARIES["Zipline"]
+
+# Rebuild DELIVERY_POINTS (declared above) from the libraries: the last waypoint
+# of every route in both pools. The aggregator imports this to detect arrivals,
+# so building it from the routes keeps the two in lock-step.
+DELIVERY_POINTS = [route[-1] for routes in ROUTE_LIBRARIES.values() for route in routes]
 
 # Areas of operation: one polygon per company, drawn dotted in the company colour.
 # Each polygon contains that company's depot AND all delivery points; Wing's leans
@@ -280,37 +290,39 @@ def distance_m(lat1, lon1, lat2, lon2):
 
 
 # ===========================================================================
-# ROUTE LOOKUP  (keyed on a POOL INDEX, not on sysid)
+# ROUTE LOOKUP  (keyed on COMPANY + a POOL INDEX, not on sysid)
 # ===========================================================================
-# Routes belong to the fleet, not to any one drone: a route index is just a
-# ticket into ROUTE_LIBRARY, and two drones holding the same ticket fly the
-# same tour. Keeping the index (rather than a copy of the waypoints) in each
-# drone's state is what lets the aggregator, the map and ui_selftest all talk
-# about "route 7" and mean the same thing.
-def route_count():
-    return len(ROUTE_LIBRARY)
+# Routes belong to a COMPANY's pool, not to any one drone: a (company, index)
+# pair is a ticket into ROUTE_LIBRARIES[company], and two drones of the same
+# company holding the same ticket fly the same tour. Keeping company + index
+# (rather than a copy of the waypoints) in each drone's state is what lets the
+# aggregator, the map and ui_selftest all talk about "Wing route 7" and mean the
+# same thing. Every helper now takes the company so it draws from the right pool.
+def route_count(company):
+    return len(ROUTE_LIBRARIES[company])
 
 
-def pick_route_idx(rng):
-    """Draw a route at random from the shared pool. No exclusion between
-    drones — collisions are the point: two drones CAN be on the same tour."""
-    return rng.randrange(len(ROUTE_LIBRARY))
+def pick_route_idx(company, rng):
+    """Draw a route at random from THIS COMPANY's pool. No exclusion between
+    drones — collisions are the point: two drones of the same company CAN be on
+    the same tour."""
+    return rng.randrange(len(ROUTE_LIBRARIES[company]))
 
 
-def delivery_point(idx):
+def delivery_point(company, idx):
     """The single drop-off for this route: its last waypoint."""
-    return ROUTE_LIBRARY[idx][-1]
+    return ROUTE_LIBRARIES[company][idx][-1]
 
 
-def outbound_route(idx):
-    """Depot -> delivery: all 16 tour vertices, then the delivery point last.
+def outbound_route(company, idx):
+    """Depot -> delivery: this company's route vertices, delivery point last.
     The caller flies these in order and drops only at the final one."""
-    return list(ROUTE_LIBRARY[idx])
+    return list(ROUTE_LIBRARIES[company][idx])
 
 
-def return_route(idx, depot):
+def return_route(company, idx, depot):
     """Delivery -> depot: the tour flown in reverse, finishing at the depot."""
-    return list(reversed(ROUTE_LIBRARY[idx][:-1])) + [tuple(depot)]
+    return list(reversed(ROUTE_LIBRARIES[company][idx][:-1])) + [tuple(depot)]
 
 
 # ===========================================================================
@@ -340,10 +352,10 @@ class SimDrone:
         self.lat, self.lon = self.depot
         self.rel_alt = 0.0
         self.phase = "to_delivery"
-        self.route_idx = pick_route_idx(self.rng)
-        self.target = delivery_point(self.route_idx)   # this tour's single drop-off
+        self.route_idx = pick_route_idx(self.company, self.rng)
+        self.target = delivery_point(self.company, self.route_idx)   # this tour's single drop-off
         self.dest = self.target          # where it's currently headed (for the flight plan)
-        self.route = outbound_route(self.route_idx)
+        self.route = outbound_route(self.company, self.route_idx)
         self.hdg = bearing_deg(self.lat, self.lon, self.route[0][0], self.route[0][1])
         self.leg_idx = 0                 # which waypoint in self.route we're flying to
         self.hover_until = 0.0
@@ -356,7 +368,7 @@ class SimDrone:
         sequence — the same messages a real GCS uses to display a full
         multi-waypoint mission line (what Mission Planner draws). The
         aggregator listens for these and uses them to draw the real
-        rectangular plan instead of a straight guess at the final target."""
+        multi-waypoint plan instead of a straight guess at the final target."""
         n = len(self.route)
         self.conn.mav.mission_count_send(0, 0, n)
         for seq, (plat, plon) in enumerate(self.route):
@@ -414,7 +426,7 @@ class SimDrone:
                 self.vz = -CLIMB_RATE * 100.0
             else:
                 self.vz = 0.0
-            # Fly vertex-by-vertex through the rectangular plan rather than
+            # Fly vertex-by-vertex through the transit plan rather than
             # beelining to the final target, so the drone tracks the whole
             # shape. No pause at any vertex — only the last one is a delivery.
             leg_tgt = self.route[self.leg_idx]
@@ -432,17 +444,17 @@ class SimDrone:
             self.vz = 0.0
             if now >= self.hover_until:
                 self.phase = "to_depot"
-                self.route = return_route(self.route_idx, self.depot)
+                self.route = return_route(self.company, self.route_idx, self.depot)
                 self.leg_idx = 0
                 self._send_route_mission()
         elif self.phase == "rest":
             self.vz = 0.0
             if now >= self.hover_until:
-                # Fresh draw from the shared pool: this drone may pick up the
-                # tour another drone just flew, or repeat its own.
-                self.route_idx = pick_route_idx(self.rng)
-                self.target = delivery_point(self.route_idx)
-                self.route = outbound_route(self.route_idx)
+                # Fresh draw from THIS company's pool: this drone may pick up
+                # the plan another same-company drone just flew, or repeat its own.
+                self.route_idx = pick_route_idx(self.company, self.rng)
+                self.target = delivery_point(self.company, self.route_idx)
+                self.route = outbound_route(self.company, self.route_idx)
                 self.leg_idx = 0
                 self.phase = "to_delivery"
                 self._send_route_mission()
