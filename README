@@ -1,0 +1,374 @@
+# GridEye — Simulations Runbook
+
+## Scope
+
+Every simulation here runs entirely on `127.0.0.1` (loopback), against ArduPilot **SITL** software drones — nothing touches a real network or a real aircraft. The attack material exists only to exercise and validate the defensive detection layer (the **GridEye Guardian**); the scripted demo (Mode A) doesn't even speak MAVLink.
+
+The monitor's ingest is a single plain‑UDP MAVLink stream keyed only by system id — nothing on it is authenticated. Anyone who can reach the ingest port can invent a "ghost" aircraft, inject fixes under an id that already exists, feed a smooth false track while the real vehicle flies elsewhere, or flip a group of drones into GUIDED at one instant. The Guardian watches that same stream and raises an alert whenever the data is physically impossible or has suspicious provenance. **It is detection only — it never transmits and never commands a vehicle.**
+
+This runbook covers three layers over the same Frisco, TX scenario, plus a standalone hijack demo:
+
+- **Part I — UTM Simulation:** benign traffic (10 lightweight drones + 2 optional real SITL drones) on one live map, including the collision‑route setup.
+- **Part II — GridEye Guardian:** the defensive (blue‑team) detection layer that lights up the Security panel when telemetry is attacked.
+- **Part III — Attack Simulation:** a red‑team MITM proxy that hijacks a small fleet and produces stealth‑gap analysis.
+
+---
+
+## What's in the box (file roster)
+
+Keep these in one folder (e.g. `~/DroneProject` on Linux, `C:\DroneProject` on Windows). `run.py` wraps the common commands cross‑platform.
+
+| File | Role |
+|---|---|
+| [`lightweight_fleet.py`](https://github.com/VDR86/DroneProject/blob/main/lightweight_fleet.py) | Scenario source of truth + the 10‑drone simulator (depots, no‑fly zones, roster: Wing 2–6, Zipline 12–16). Feeds ingest on UDP 14570. |
+| `aggregator.py` | Read‑only monitor backend. Parses the ingest stream, applies flight rules, folds in Guardian alerts, serves the map and JSON on `:8000`. Listens only. |
+| `grideye_guardian.py` | The attack detector. Consumes the telemetry the aggregator already receives and returns alert strings. Transmits nothing. |
+| `map.html` | Dashboard. NOMINAL / ADVISORY / SECURITY condition; Security panel lists attacked aircraft and which detectors fired. |
+| `ui_selftest.py` | Scripted canned attack feed for the dashboard (browser‑only fake JSON). Drives every visual state on demand. |
+| `run.py` | Launcher / tutorial. Wraps fleet, monitor, selftest, and the detector tests. |
+| [`fleet_attack.py`](https://github.com/VDR86/DroneProject/blob/main/fleet_attack.py) | Two roles: (1) the red‑team MITM proxy + attacker console used in **Part III**; (2) backend logic (geography + scatter‑offset constants) that `ui_selftest.py` reuses in **Part II, Mode A**. |
+
+> **Naming note:** the UTM dashboard is referred to as `map.html` throughout this merged runbook. Earlier UTM material called it `utm_map.html`; if the repo file is still named `utm_map.html`, treat the two as the same dashboard.
+
+---
+
+## One‑time setup (do once, then skip)
+
+### Windows (native — no WSL, no Linux VM)
+
+The two real drones use the same `ArduCopter.exe` that Mission Planner downloads, plus MAVProxy for the port fan‑out.
+
+1. **Project files** — put the scripts above in a folder, e.g. `C:\DroneProject`.
+2. **Python** — install Python 3 from python.org; on the first installer screen tick **"Add python.exe to PATH."** Then install the MAVLink library:
+   ```
+   pip install pymavlink
+   ```
+   (If `python`/`pip` aren't found, use `py` and `py -m pip install pymavlink`.)
+3. **QGroundControl** — install the Windows version (the `.exe` installer).
+4. **Mission Planner** — install the Windows version (runs natively — no Mono).
+5. **ArduCopter.exe (the SITL binary)** — open Mission Planner → **SIMULATION** tab → click **Multirotor → Quad** once. It downloads `ArduCopter.exe` to `Documents\Mission Planner\sitl\`. Let it connect, then close that simulation.
+6. **MAVProxy for Windows** — install from ArduPilot's MAVProxy Windows installer (gives you `mavproxy.exe`).
+
+The first time Python, `ArduCopter.exe`, or `mavproxy.exe` opens a network port, Windows Firewall will pop up — click **Allow access** (Private networks is enough).
+
+### Linux
+
+- Install ArduPilot SITL (`sim_vehicle.py` on your PATH) and `pip install pymavlink`.
+- QGroundControl AppImage (e.g. `~/QGroundControl-x86_64.AppImage`).
+- Mission Planner via Mono (`LIBGL_ALWAYS_SOFTWARE=1 mono MissionPlanner.exe`).
+
+---
+
+# Part I — UTM Simulation (benign traffic + live map)
+
+Two delivery companies (Wing + Zipline), 12 drones over Frisco, TX, on one live map. 10 drones fly themselves; 2 are optional real ArduPilot SITL drones flown by two ground stations (QGroundControl = Wing, Mission Planner = Zipline). Everything is on `127.0.0.1`. Use one window per numbered step and leave each open.
+
+> For a **tracking‑only** view, you can skip steps 4–7 entirely — the 10 lightweight drones still show on the map on their own.
+
+### 1. Start the background traffic — 10 lightweight drones
+
+```
+cd ~/DroneProject            # Windows: cd C:\DroneProject
+python3 lightweight_fleet.py # Windows: python lightweight_fleet.py
+```
+Leave running. It lists the 10 drones (Wing 2–6, Zipline 12–16) and flies them on delivery routes.
+
+### 2. Start the UTM monitor backend
+
+```
+python3 aggregator.py        # Windows: python aggregator.py
+```
+Wait for `serving http://localhost:8000/` and a `[utm] 10/10 active` line.
+
+### 3. Open the map — in the browser, by URL
+
+Go to **http://localhost:8000/**
+
+Do **not** double‑click `map.html` — a `file://` page can't reach the backend and shows *"aggregator offline."* You should see the dark Frisco map with both fleets moving.
+
+### 4. (Optional) Add the two real SITL drones
+
+**Wing — sysid 1**, depot `33.1543,-96.8700`:
+
+Linux:
+```
+sim_vehicle.py -v ArduCopter -I0 --sysid 1 \
+  --custom-location=33.1543,-96.8700,215,0 \
+  --out udp:127.0.0.1:14570 --out udp:127.0.0.1:14550
+```
+Windows — cmd window A (SITL), then cmd window B (MAVProxy fan‑out):
+```
+cd "%USERPROFILE%\Documents\Mission Planner\sitl"
+ArduCopter.exe --model quad --home 33.1543,-96.8700,215,0 -I0
+```
+```
+mavproxy.exe --master=tcp:127.0.0.1:5760 --out=udp:127.0.0.1:14570 --out=udp:127.0.0.1:14550
+```
+`14570` feeds the UTM map; `14550` feeds QGroundControl. Wait for GPS lock / `EKF ... using GPS`.
+
+**Zipline — sysid 11**, depot `33.1180,-96.7720`:
+
+Linux:
+```
+sim_vehicle.py -v ArduCopter -I1 --sysid 11 \
+  --custom-location=33.1180,-96.7720,215,0 \
+  --out udp:127.0.0.1:14570 --out udp:127.0.0.1:14560
+```
+Windows — cmd window C (SITL), then cmd window D (MAVProxy fan‑out):
+```
+cd "%USERPROFILE%\Documents\Mission Planner\sitl"
+ArduCopter.exe --model quad --home 33.1180,-96.7720,215,0 -I1
+```
+```
+mavproxy.exe --master=tcp:127.0.0.1:5770 --out=udp:127.0.0.1:14570 --out=udp:127.0.0.1:14560
+```
+`14560` feeds Mission Planner. On Windows, give this one its Zipline system id at the MAVProxy prompt (window D):
+```
+param set SYSID_THISMAV 11
+reboot
+```
+
+### 5. Connect the two ground stations
+
+- **QGroundControl (Wing / drone 1):** launch it — it auto‑connects on 14550.
+- **Mission Planner (Zipline / drone 11):** launch it, then top‑right **UDP → Connect → port 14560**.
+
+Keep them separate: **QGC on 14550 only, Mission Planner on 14560 only**, so each controls one company.
+
+### 6. Get the real drones airborne
+
+Take off from the SITL / MAVProxy terminal (**not** the GCS takeoff button — the button can fail over the forwarded link, but "Fly to here" works fine once airborne). For each drone:
+```
+mode guided
+arm throttle
+takeoff 60
+```
+Then steer: in QGC use **Fly to here** (Wing); in Mission Planner right‑click the map → **Fly To Here** (Zipline).
+
+### 7. The collision‑route demo
+
+1. Get both real drones to the same altitude (e.g. 60 m) so it's a clean horizontal crossing.
+2. Pick a convergence point between the two depots — about **33.135, -96.82** (the gap between Wing in the west and Zipline in the east).
+3. At the same moment, send drone 1 there from QGC and drone 11 there from Mission Planner. Watch both tracks close on the UTM map. *(The separation alert that flags this is the next build.)*
+
+---
+
+# Part II — GridEye Guardian (defensive / blue‑team)
+
+This section drives the defensive layer and shows the Security panel light up when telemetry is attacked — same dashboard, same ingest as Part I, now with an adversary on the wire. It is the security counterpart to Part I.
+
+**Launcher (`run.py`) menu:**
+1. **Normal** (fleet + `aggregator.py`, the live monitor). You can connect the two real SITL drones (Part I, §4); their `--out` feeds the same ingest on 14570, so the monitor and Guardian track them live alongside the 10 lightweight drones.
+2. **Attacked** (fleet + `ui_selftest.py`, the scripted feed for Mode A). This canned feed is browser‑only and **cannot** take real drones.
+
+## Mode A — Scripted attack demo (visuals, no injection)
+
+The fastest, most reliable way to show every Security‑panel state. `ui_selftest.py` serves the **real** dashboard on `:8000` with a canned feed and fires staged attacks from the keyboard. It does not speak MAVLink, connect to any drone, or send anything to the real aggregator — it only feeds the webpage a fixed response, so you can demo the display with nothing else running.
+
+The demo fleet is the full 10 aircraft (Wing 2–6, Zipline 12–16), matching the real roster 1:1. It starts in NOMINAL. There is no on‑page control of any kind — everything is driven from the terminal `ui_selftest.py` runs in, so nobody who can merely load the dashboard can change what it shows. Requires `lightweight_fleet.py` **and** `fleet_attack.py` in the same folder (geography and the scatter‑offset constants — neither is actually connected to).
+
+**Run:** stop the real aggregator first (it shares port 8000), then launch `run.py` → **option 2 (Attacked)**. Open the dashboard, switch back to the `ui_selftest.py` terminal, and drive it:
+
+| Key | Effect |
+|---|---|
+| `1` | Scenario: fleet hijack (coordinated GUIDED + jumps) |
+| `2` | Scenario: ghost aircraft / rogue node (unregistered sysid) |
+| `3` | Scenario: telemetry falsification (climb rate or speed) |
+| `4` | Scenario: gradual escalation (stages in over ~12 s) |
+| `5` | Scenario: GPS spoofing (false reported position) |
+| `6` | Scenario: combined attack (hijack hits all flight rules) |
+| `Enter` | Toggle the current scenario's takeover on/off |
+| `a` | Force attack ON (current scenario) |
+| `c` | Force clean → back to NOMINAL |
+| `auto` | Timed loop: clean ~10 s, then attack, repeat |
+| `q` | Quit |
+
+Pick a scenario (1–6), press `a` (or `Enter`) to fire it, and watch the dashboard flip to SECURITY with the attacked aircraft target‑locked and the matching detector listed. Press `c` to return to NOMINAL.
+
+## Mode B — Live end‑to‑end (attack the running monitor)
+
+This drives the detector with real network traffic instead of a canned feed — the true end‑to‑end proof, since the detector only ever sees what actually reaches UDP 14570.
+
+**1. Start the normal system.** Launch `run.py` → **option 1 (Normal)**. A clean run shows the drones moving, condition NOMINAL, and an empty Security panel. Optionally bring up the two real SITL drones as in **Part I, §4** — giving real moving vehicles to impersonate.
+
+**2. Put an adversary on the ingest port** (your red‑team step). The attack is any MAVLink sender aimed at `udpout:127.0.0.1:14570`. What the Guardian flags depends on what you send:
+
+- **Ghost aircraft:** emit telemetry under a sysid that isn't in the roster → `GHOST_ID`.
+- **Impersonation:** emit fixes under a sysid that already exists, from a second source, while the real one is still live → `SRC_CONFLICT` (or `SRC_HANDOFF` if the real source has already gone quiet).
+- **False track:** forge positions that imply impossible speed/climb, or a heading that disagrees with the movement vector → `TELEPORT`, `CLIMB_RATE`, `VEL_MISMATCH`, `GPS_ATTACK`.
+- **Takeover:** flip three or more drones into GUIDED inside a ~3 s window → `FLEET_GUIDED`.
+
+A minimal ghost‑injection check (confirms `GHOST_ID` end‑to‑end, loopback only):
+
+```python
+python3 - <<'PY'
+import time
+from pymavlink import mavutil
+# Send to the monitor's ingest as an UNKNOWN system id (47 is not in the roster).
+m = mavutil.mavlink_connection('udpout:127.0.0.1:14570', source_system=47)
+for _ in range(40):
+    m.mav.heartbeat_send(2, 3, 0, 0, 0)  # MAV_TYPE_QUADROTOR, ARDUPILOTMEGA
+    m.mav.global_position_int_send(
+        int(time.time()*1000) & 0xFFFFFFFF,
+        int(33.130e7), int(-96.810e7),   # lat, lon (1e7)
+        60000, 60000, 0, 0, 0, 9000)     # alt/relalt(mm), vx, vy, vz, hdg(cdeg)
+    time.sleep(0.25)
+PY
+```
+
+Within a couple of seconds the dashboard flips to SECURITY and the Security panel lists sysid 47 with `GHOST_ID`. Stop the sender and it clears back to NOMINAL after the stale timeout.
+
+> **`FLEET_GUIDED` note:** it needs at least three near‑simultaneous GUIDED switches, so hijacking only the two real SITL drones won't trip it — use Mode A's fleet‑hijack scenario, or inject GUIDED for three or more sysids.
+
+**3. Coverage check — did the attack reach the ingest? (optional).** The detector only catches what arrives on 14570. Run the tap instead of the aggregator (they share the port, so run one at a time):
+```
+python3 run.py tap   # then start the fleet and/or your red-team run
+```
+Watch for a new source address appearing under a system id that already exists — that's injection on the wire. If your attack never shows in the tap, the monitor legitimately can't see it and you've found a coverage gap.
+
+## Detector reference
+
+Every security message is prefixed so it reads distinctly from the amber flight‑rule alerts (altitude, no‑fly, area).
+
+| Detector | Fires when… | Fire it with |
+|---|---|---|
+| `GHOST_ID` | Telemetry arrives under a sysid not in the fleet roster. | Scenario 2 / inject an unknown sysid |
+| `SRC_CONFLICT` | One sysid is seen from two network sources at once (impersonation). | Inject an existing sysid from a 2nd source |
+| `SRC_HANDOFF` | A source change after the prior source had already gone quiet (advisory, lower confidence). | Inject after the real source stops |
+| `TELEPORT` | A fix‑to‑fix jump implies a speed no aircraft could fly (> 45 m/s). | Scenario 1/6 / forge a big position jump |
+| `CLIMB_RATE` | Altitude changes faster than the airframe physically can (> 12 m/s). | Scenario 3/6 / forge a large alt jump |
+| `VEL_MISMATCH` | Reported ground speed disagrees with the speed implied by the track (sustained). | Scenario 3/6 / forge speed vs position |
+| `GPS_ATTACK` | Reported heading disagrees with the bearing implied by consecutive fixes (sustained) — false‑position fingerprint. | Scenario 5 / forge position, leave heading |
+| `FLEET_GUIDED` | Three or more drones switch to GUIDED inside a ~3 s window (coordinated takeover). | Scenario 1/6 / GUIDED for 3+ sysids |
+| `OUT_AO` | Reported position outside the drone's company area of operations. Off in `aggregator.py` (handled as a flight‑rule alert instead). | n/a in the default monitor |
+
+**Why it only works here.** Every detector above depends on the ingest being unsigned/cleartext. Turning on MAVLink message signing is the fix an operator would deploy — it makes injection and impersonation bounce, which is the point the demo makes.
+
+## Reading the dashboard
+
+- **Condition banner:** NOMINAL (all clear) → ADVISORY (a flight‑rule alert is active) → SECURITY (a Guardian detector fired). SECURITY takes precedence.
+- **Attacked aircraft:** get a magenta target‑lock marker; flight‑rule alerts get an amber ping.
+- **Security panel:** lists each flagged aircraft and which detectors fired on it.
+- **Raw feed:** the same data is at http://localhost:8000/api/drones if you want to script assertions against it.
+
+## Detector logic tests (no network)
+
+Fastest confidence check that the detectors themselves are sound — runs the Guardian against plain Python values, no fleet, no sockets:
+```
+python3 run.py test   # expect all tests green
+```
+
+---
+
+# Part III — Attack Simulation (red‑team MITM fleet hijack)
+
+A standalone MITM demonstration: a proxy sits between three SITL drones and their ground stations, then hijacks the whole fleet on command and logs the "true vs displayed" gap.
+
+### 1. Start the 3 SITL drones (one terminal each)
+
+```
+sim_vehicle.py -v ArduCopter -I0 --sysid 1 --customlocation=40.7828166,16.9320566,350,0 --no-mavproxy
+sim_vehicle.py -v ArduCopter -I1 --sysid 2 --customlocation=40.7833166,16.9320566,350,0 --no-mavproxy
+sim_vehicle.py -v ArduCopter -I2 --sysid 3 --customlocation=40.7828166,16.9325566,350,0 --no-mavproxy
+```
+Drones land on TCP 5760 / 5770 / 5780. `--no-mavproxy` leaves the links free for the proxy. Wait for GPS lock / `EKF ... using GPS` in each.
+
+### 2. Start the attack proxy (the MITM hub + attacker console)
+
+```
+cd ~/DroneProject
+python3 fleet_attack.py
+```
+It connects to all three drones and prints the red console menu. Leave it focused — you'll type `go` here.
+
+### 3. Connect the TRUTH view — QGroundControl
+
+Launch QGC; it auto‑connects on 14550 and shows the real fleet.
+```
+~/QGroundControl-x86_64.AppImage
+```
+
+### 4. Connect the VICTIM operator — Mission Planner
+
+Launch Mission Planner, then top‑right **UDP → Connect → port 14560**.
+```
+cd ~/DroneProject/MissionPlanner        # your Mission Planner folder
+LIBGL_ALWAYS_SOFTWARE=1 mono MissionPlanner.exe
+```
+
+### 5. Fly the legitimate mission (in Mission Planner)
+
+For each of the 3 drones (select each vehicle, sysid 1/2/3): in the **Plan** tab draw a short mission or select a previously‑created one (takeoff + a couple of waypoints), **Write** it to the vehicle, then in **Actions** set mode **AUTO** and **Arm** — they take off and fly the mission. Let them get airborne and moving.
+
+### 6. Strike — synchronized takeover + spoof
+
+In the `fleet_attack.py` console (step 2 window), type:
+```
+go
+```
+All three drones switch to GUIDED and the spoof engages at the same instant. On QGC you'll see them break off; on Mission Planner they keep tracking the mission. Each drone prints `entered GUIDED at t=…` — the spread between those is your fleet‑synchrony number. Then steer the hijacked fleet from QGC with **Fly to here**.
+
+**Console commands:**
+
+| Command | Effect |
+|---|---|
+| `go` | Hijack ALL drones at once → GUIDED + spoof; then steer from QGC |
+| `scatter` | Proxy auto‑flies the whole fleet to offset points (hands‑off demo) |
+| `stop` | Proxy lets go (drones hold; QGC can steer; spoof stays on) |
+| `land` | Force the whole fleet to LAND (ends the attack) |
+| `rtl` | Force the whole fleet to RTL (ends the attack) |
+| `q` | Quit |
+
+### 7. Stop
+
+Press Ctrl+C (or `q`) in the `fleet_attack.py` console. It writes per‑drone logs (`true_D1.csv` / `displayed_D1.csv`, …) — overwritten each run.
+
+---
+
+## Shutdown
+
+Ctrl+C in each terminal (fleet, monitor/selftest, any injector, and the SITL/MAVProxy windows — type Ctrl+C in the MAVProxy windows too), then close QGroundControl, Mission Planner, and the browser tab. If you used the launcher's windowed mode, Ctrl+C or close each window it opened.
+
+---
+
+## Troubleshooting
+
+**Map / dashboard**
+- **"aggregator offline" / map won't load:** you opened the file directly. Use **http://localhost:8000/**, and keep `map.html` in the same folder as the server that's running.
+- **Port 8000 in use starting selftest:** stop the real aggregator first; `ui_selftest.py` and `aggregator.py` both serve `:8000`.
+
+**Guardian / detection (Part II)**
+- **Security panel never lights up (Mode A):** the selftest starts NOMINAL by design — pick a scenario (1–6) and press `a` in its terminal.
+- **Security panel never lights up (Mode B):** your traffic isn't reaching 14570, or it's under a valid sysid with plausible physics. Confirm with the tap (`python3 run.py tap`) and check you're sending to `udpout:127.0.0.1:14570`.
+- **`FLEET_GUIDED` won't fire:** it needs 3+ GUIDED switches within ~3 s — two real drones aren't enough; use Mode A or inject 3+ sysids.
+- **"cannot bind UDP 14570" / port in use:** another process already holds the ingest port (aggregator, tap, or a stale run). Only one can hold it at a time — stop it and retry.
+- **`ModuleNotFoundError: pymavlink`:** activate the venv and `pip install pymavlink`.
+
+**Real drones / ground stations**
+- **A drone won't arm / "failed to change to guided mode":** set `ARMING_CHECK = 0` (simulation only), Write, then retry. (SITL terminal / MAVProxy: `param set ARMING_CHECK 0`; Mission Planner: Config → Full Parameter List. On Linux you may need `param fetch` first.)
+- **A drone ignores commands / acts like it has a stale mission:** clear it — `wp clear` then `mode guided` (SITL/MAVProxy), or Plan → Clear in Mission Planner. For a clean slate on Linux, relaunch that drone once with `-w` (wipes params + mission), let it finish, Ctrl+C, then relaunch without `-w`.
+- **`go` does nothing for a drone (Part III):** it had no position fix yet — let it fly the mission a bit first, then `go`. The console prints which drones it skipped.
+- **Victim (MP) shows drones frozen/odd during the attack:** they need real flight before `go` so there's a track to replay — fly the mission for ~20 s first.
+- **`fleet_attack.py` writes no logs:** it writes `true_D1.csv` / `displayed_D1.csv` etc. to the folder you launched it from — check you're in that folder and that at least one drone actually got hijacked.
+- **A drone won't appear on the map:** check its `--out udp:127.0.0.1:14570` is present and the aggregator console shows it in the active count.
+- **QGC or MP grabbed the wrong drone:** QGC must be on **14550 only**, Mission Planner on **14560 only**, so each GCS controls one company.
+
+**Windows‑specific**
+- **`python` not recognized:** reinstall Python with "Add to PATH," or use `py` / `py -m pip install pymavlink`.
+- **Firewall popups:** click **Allow access** for Python, `ArduCopter.exe`, and MAVProxy.
+- **`ArduCopter.exe` not found:** run the Mission Planner SIMULATION tab once (setup step 5) to download it; it lives in `Documents\Mission Planner\sitl\`.
+- **`mavproxy.exe` not recognized:** run it from its install folder, or add that folder to PATH.
+
+---
+
+## Port map (consolidated reference)
+
+| Port | Purpose |
+|---|---|
+| 14570 | UTM aggregator ingest (whole fleet → aggregator/tap; also the attacker's target in Part II) |
+| 8000 | Dashboard + JSON API (http://localhost:8000/, `/api/drones`) |
+| 14550 | QGroundControl — Wing (drone 1) truth view / attacker steering |
+| 14560 | Mission Planner — Zipline (drone 11) victim operator |
+| 5760 / 5770 / 5780 | SITL drones over TCP (5760 Wing, 5770 Zipline; 5780 is the 3rd drone in Part III) — MAVProxy / proxy connect here |
+
+**What you'll have open (full Part I on Windows):** 6 command windows (fleet, aggregator, 2× `ArduCopter.exe`, 2× MAVProxy) + QGroundControl + Mission Planner + the browser.
