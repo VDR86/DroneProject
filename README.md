@@ -6,6 +6,12 @@ GridEye is a simulated drone-fleet monitoring system. A fleet of simulated drone
 
 ---
 
+## Demo
+
+Watch the demo video of the GridEye web interface: [GridEye Demo Video](https://drive.google.com/file/d/1foH3cFJgS4GeDSAXQ1gfDbjtxwATjZ6l/view)
+
+---
+
 ## Why this exists
 
 The aggregator's ingest is a single plain-UDP MAVLink stream keyed only by system ID, with no authentication. Anyone who can reach the port could inject fixes for an existing drone, invent a "ghost" aircraft, feed a plausible fake track, or flip several drones into `GUIDED` mode at once. GridEye detects these situations by checking whether the data is physically possible and where it came from.
@@ -128,3 +134,5 @@ The load tests cover three scenarios:
 - **Normal traffic** (`load_test_single_socket_normal.py`): a baseline where all telemetry is physically plausible. This is the reference for what a healthy dashboard looks like.
 - **Teleport scenario** (`load_test_single_socket_teleports.py`): position fixes with impossible jumps, to confirm the Guardian raises `TELEPORT` alerts while the aggregator keeps up.
 - **Multi-socket** (`load_test_multisocket.py`): telemetry arriving from multiple network sources, to exercise source-tracking checks such as `SRC_CONFLICT` and `SRC_HANDOFF` at scale.
+
+
