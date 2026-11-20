@@ -119,18 +119,12 @@ python ui_selftest.py                        # UI self-test
 
 ---
 
-## Screenshots
+## Screenshots: Load Test Results
 
-See the `Screenshots/` folder.
+The images in the `Screenshots/` folder (plus the `Screenshot_2026-07-30_18_09_18.png` in the repo root) were captured while running the load test scripts. They show how the aggregator and map UI behave as telemetry volume increases, and how the Guardian responds under load.
 
-<!-- ![GridEye map](Screenshots/your-image.png) -->
+The load tests cover three scenarios:
 
----
-
-## Roadmap / ideas
-
-- Authenticated or signed MAVLink ingest
-- Persistent alert history
-- Configurable detector thresholds via a config file
-
----
+- **Normal traffic** (`load_test_single_socket_normal.py`): a baseline where all telemetry is physically plausible. This is the reference for what a healthy dashboard looks like.
+- **Teleport scenario** (`load_test_single_socket_teleports.py`): position fixes with impossible jumps, to confirm the Guardian raises `TELEPORT` alerts while the aggregator keeps up.
+- **Multi-socket** (`load_test_multisocket.py`): telemetry arriving from multiple network sources, to exercise source-tracking checks such as `SRC_CONFLICT` and `SRC_HANDOFF` at scale.
