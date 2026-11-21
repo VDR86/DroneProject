@@ -131,8 +131,8 @@ The images in the `Screenshots/` folder (plus the `Screenshot_2026-07-30_18_09_1
 
 The load tests cover three scenarios:
 
-- **Normal traffic** (`load_test_single_socket_normal.py`): a baseline where all telemetry is physically plausible. This is the reference for what a healthy dashboard looks like.
-- **Teleport scenario** (`load_test_single_socket_teleports.py`): position fixes with impossible jumps, to confirm the Guardian raises `TELEPORT` alerts while the aggregator keeps up.
-- **Multi-socket** (`load_test_multisocket.py`): telemetry arriving from multiple network sources, to measure the difference in attacker performance.
+- **Normal traffic** (`load_test_single_socket_normal.py`): a baseline where all telemetry is physically plausible and attacker overhead is minimal.
+- **Teleport scenario** (`load_test_single_socket_teleports.py`): randomized positional telemetry to examine movement algorithm performance differences and alert system degradation.
+- **Multi-socket** (`load_test_multisocket.py`): telemetry arriving from multiple network sources, to examine network methodology performance differences.
 
 
